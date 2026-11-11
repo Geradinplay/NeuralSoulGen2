@@ -1,0 +1,28 @@
+# Сборка Maven
+target/
+*.class
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Модели (GGUF и прочие веса — гигабайты)
+model/
+
+# Рантаймы (llama.cpp, Qdrant, FishSpeech, whisper — бинари)
+runtime/
+
+# Данные приложения (память диалогов — личные данные)
+data/
+
+# Логи
+logs/
+*.log
+
+# Служебное
+.DS_Store
+Thumbs.db
+hs_err_pid*.log
+replay_pid*.log
+/src/main/java/old/
