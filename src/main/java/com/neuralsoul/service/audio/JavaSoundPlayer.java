@@ -19,7 +19,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import javax.sound.sampled.*;
 
 /**
- * Reusable PCM16 output for Fish Speech. The hardware SourceDataLine remains OPEN and
+ * Reusable PCM16 output for streaming TTS. The hardware SourceDataLine remains OPEN and
  * STARTED between LLM replies; a single writer thread maintains a very short silence
  * keepalive while idle. HTTP reading never writes directly to the sound driver.
  *
@@ -54,7 +54,7 @@ public final class JavaSoundPlayer implements AudioPlayer {
   @Override public void start() { running = true; }
   @Override public boolean isRunning() { return running; }
 
-  /** Opens the sound device once when Fish Speech comes online, even before the first reply. */
+  /** Opens the sound device once when the TTS engine comes online, even before the first reply. */
   @Override public void preparePcmOutput(int sampleRate, int channels) throws Exception {
     start();
     ensureOutput(pcmFormat(sampleRate, channels));
@@ -217,7 +217,7 @@ public final class JavaSoundPlayer implements AudioPlayer {
       TtsTrace.log("PLAYER_DEVICE_OPEN", "sampleRate=" + rate + " channels=" + format.getChannels()
           + " bufferBytes=" + output.getBufferSize() + " selectedOutput=" + selectedOutput
           + " keepOpenAcrossReplies=true");
-      writer = new Thread(this::writeLoop, "fish-tts-persistent-audio");
+      writer = new Thread(this::writeLoop, "tts-persistent-audio");
       writer.setDaemon(true);
       writer.start();
     }
@@ -422,17 +422,36 @@ public final class JavaSoundPlayer implements AudioPlayer {
 
   @Override public void play(byte[] wav) throws Exception {
     if (!running) throw new IllegalStateException("Audio player stopped");
-    // Legacy Coqui/OpenAI WAV playback is intentionally kept separate from Fish PCM.
-    try (AudioInputStream input = AudioSystem.getAudioInputStream(new ByteArrayInputStream(wav))) {
-      SourceDataLine output = lineFactory.open(configs, input.getFormat());
+    // Legacy Coqui/OpenAI WAV playback is intentionally kept separate from streaming PCM.
+    try (AudioInputStream source = AudioSystem.getAudioInputStream(new ByteArrayInputStream(wav))) {
+      AudioFormat sourceFormat = source.getFormat();
+      // Many Windows audio drivers exposed through Java Sound reject 24-bit PCM
+      // (for example 44.1 kHz stereo, 6 bytes/frame). Convert previews and legacy
+      // WAV responses to the widely supported signed 16-bit little-endian format.
+      AudioFormat playbackFormat = sourceFormat;
+      AudioInputStream playback = source;
+      if (!AudioFormat.Encoding.PCM_SIGNED.equals(sourceFormat.getEncoding())
+          || sourceFormat.getSampleSizeInBits() != 16
+          || sourceFormat.isBigEndian()) {
+        playbackFormat = new AudioFormat(AudioFormat.Encoding.PCM_SIGNED,
+            sourceFormat.getSampleRate(), 16, sourceFormat.getChannels(),
+            sourceFormat.getChannels() * 2, sourceFormat.getSampleRate(), false);
+        if (!AudioSystem.isConversionSupported(playbackFormat, sourceFormat)) {
+          throw new UnsupportedAudioFileException("Не поддерживается преобразование WAV: "
+              + sourceFormat + " → " + playbackFormat);
+        }
+        playback = AudioSystem.getAudioInputStream(playbackFormat, source);
+      }
+      SourceDataLine output = lineFactory.open(configs, playbackFormat);
       wavLine = output;
-      try {
-        output.open(input.getFormat());
+      try (AudioInputStream input = playback == source ? null : playback) {
+        output.open(playbackFormat);
         if (!running || Thread.currentThread().isInterrupted()) throw new InterruptedException();
         output.start();
         byte[] buffer = new byte[4096];
         int read;
-        while ((read = input.read(buffer)) != -1) {
+        AudioInputStream audio = playback == source ? source : playback;
+        while ((read = audio.read(buffer)) != -1) {
           if (!running || Thread.currentThread().isInterrupted()) throw new InterruptedException();
           output.write(buffer, 0, read);
         }

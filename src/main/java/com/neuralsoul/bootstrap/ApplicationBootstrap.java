@@ -29,10 +29,10 @@ public final class ApplicationBootstrap {
     // 4. Runtime services.
     ServiceLocator services = ServiceLocator.getInstance();
     services.setTtsDevices(() -> {
-      java.util.List<com.neuralsoul.service.tts.FishSpeechTtsService.AllowedDevice> choices = new java.util.ArrayList<>();
+      java.util.List<com.neuralsoul.service.tts.CosyVoiceTtsService.AllowedDevice> choices = new java.util.ArrayList<>();
       var info = com.neuralsoul.hardware.HardwareLocator.getInstance().info();
       boolean cpuEnabled = state.devices.stream().anyMatch(d -> "CPU".equals(d.id) && d.enabled.get());
-      choices.add(new com.neuralsoul.service.tts.FishSpeechTtsService.AllowedDevice(
+      choices.add(new com.neuralsoul.service.tts.CosyVoiceTtsService.AllowedDevice(
           -1, "CPU", "CPU", 0L, cpuEnabled));
       if (info != null) for (var gpu : info.gpus()) {
         boolean enabled = state.devices.stream().anyMatch(d ->
@@ -40,7 +40,7 @@ public final class ApplicationBootstrap {
         long freeGpuVram = com.neuralsoul.hardware.HardwareLocator.getInstance().telemetry().gpus()
             .stream().filter(g -> g.index() == gpu.index()).mapToLong(g -> g.freeVramBytes())
             .findFirst().orElse(0L);
-        choices.add(new com.neuralsoul.service.tts.FishSpeechTtsService.AllowedDevice(
+        choices.add(new com.neuralsoul.service.tts.CosyVoiceTtsService.AllowedDevice(
             gpu.index(), gpu.name(), gpu.vendor(),
             freeGpuVram > 0 ? freeGpuVram : gpu.totalVramBytes(), enabled, gpu.id()));
       }

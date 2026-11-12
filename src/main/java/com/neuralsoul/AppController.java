@@ -30,7 +30,7 @@ public final class AppController implements AutoCloseable {
   private final AssistantBackend backend;
   private final SettingsStore store;
   private final ServiceLocator services;
-  /** Optional Fish Speech startup error; retained in the TTS status after the startup dialog closes. */
+  /** Optional CosyVoice startup error; retained in the TTS status after the startup dialog closes. */
   private volatile String ttsStartupError;
   private final GenerationPipeline pipeline;
   private final RuntimeLifecycleManager runtimeLifecycle = new RuntimeLifecycleManager();
@@ -571,49 +571,50 @@ public final class AppController implements AutoCloseable {
                 pipeline.start();
                 checkStartupCancelled(startupCancelled);
 
-                // Fish Speech is a long-lived process. Start it once with the system, not on
+                // CosyVoice is a long-lived process. Start it once with the system, not on
                 // every sentence, so the GGUF and KV buffers remain resident between requests.
                 // TTS is optional: a missing executable/model should be visible in both the
                 // startup dialog and the main TTS status, but must not disable the Main LLM.
-                startupStage[0] = "Загрузка Fish Speech S2-Pro";
+                startupStage[0] = "Загрузка CosyVoice";
                 if (services != null && services.isInitialized()) {
                   try {
                     var ttsSettings = new com.neuralsoul.config.SpeechGenerationSettingsStore(
                         store.configs().directory()).load();
                     if (!ttsSettings.common().enabled()) {
-                      System.out.println("[FishSpeech] startup skipped: disabled (common.enabled=false)");
+                      System.out.println("[CosyVoice] startup skipped: disabled (common.enabled=false)");
                       Platform.runLater(startupDialog::ttsDisabled);
                     } else {
-                      System.out.println("[System] Starting Fish Speech S2-Pro: model="
-                          + ttsSettings.fish().modelPath() + ", runtime="
-                          + ttsSettings.fish().runtimePreference() + ", transport="
+                      System.out.println("[System] Starting CosyVoice: model="
+                          + ttsSettings.cosy().modelPath() + ", backend="
+                          + ttsSettings.cosy().backend() + ", transport="
                           + ttsSettings.common().transport());
-                      startupStatus("Загрузка Fish Speech S2-Pro…");
+                      startupStatus("Загрузка CosyVoice…");
                       Platform.runLater(startupDialog::ttsLoading);
                       services.tts().start();
                       checkStartupCancelled(startupCancelled);
                       // Keep Java Sound open between all replies, not just between phrases.
+                      // CosyVoice3 outputs ~24 kHz mono PCM16.
                       try {
-                        services.player().preparePcmOutput(44100, 1);
-                        System.out.println("[FishSpeech/Audio] persistent output ready (44100 Hz mono)");
+                        services.player().preparePcmOutput(24000, 1);
+                        System.out.println("[CosyVoice/Audio] persistent output ready (24000 Hz mono)");
                       } catch (Exception audioError) {
                         // A missing sound device must not prevent text generation or native TTS startup.
-                        System.err.println("[FishSpeech/Audio] pre-open failed; will retry on playback: " + audioError);
+                        System.err.println("[CosyVoice/Audio] pre-open failed; will retry on playback: " + audioError);
                       }
-                      System.out.println("[FishSpeech] ready — runtime stays resident between generations");
+                      System.out.println("[CosyVoice] ready — runtime stays resident between generations");
                       Platform.runLater(startupDialog::ttsReady);
                     }
                   } catch (java.util.concurrent.CancellationException e) {
                     throw e;
                   } catch (Exception ttsError) {
                     ttsStartupError = GenerationPipeline.message(ttsError);
-                    System.out.println("[FishSpeech] optional startup FAILED: " + ttsStartupError);
+                    System.out.println("[CosyVoice] optional startup FAILED: " + ttsStartupError);
                     ttsError.printStackTrace(System.out);
                     String errorText = ttsStartupError;
                     Platform.runLater(() -> startupDialog.ttsFailed(errorText));
                   }
                 } else {
-                  System.out.println("[FishSpeech] startup skipped: TTS service is not initialized");
+                  System.out.println("[CosyVoice] startup skipped: TTS service is not initialized");
                   Platform.runLater(startupDialog::ttsDisabled);
                 }
                 checkStartupCancelled(startupCancelled);
@@ -645,11 +646,11 @@ public final class AppController implements AutoCloseable {
                       new com.neuralsoul.hardware.GpuMemoryAudit.Target("General: " + entry.getKey(), entry.getValue()));
                   if (services != null && services.isInitialized()
                       && services.tts() instanceof com.neuralsoul.service.tts.RoutingTtsService routing) {
-                    long fishPid = routing.fishOwnedPid();
-                    if (fishPid > 0) audit.add(new com.neuralsoul.hardware.GpuMemoryAudit.Target(
-                        "Fish Speech S2-Pro", fishPid));
-                    else if (routing.isFishEnabled()) System.out.println(
-                        "[GPU/ACTUAL] Fish Speech has no owned PID (external server or startup failure); "
+                    long cosyPid = routing.cosyOwnedPid();
+                    if (cosyPid > 0) audit.add(new com.neuralsoul.hardware.GpuMemoryAudit.Target(
+                        "CosyVoice", cosyPid));
+                    else if (routing.isCosyEnabled()) System.out.println(
+                        "[GPU/ACTUAL] CosyVoice has no owned PID (external server or startup failure); "
                         + "cannot safely attribute another process's memory");
                   }
                   com.neuralsoul.hardware.GpuMemoryAudit.printAfterStartup(audit);

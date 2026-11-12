@@ -20,7 +20,7 @@ public final class StartupDialog {
   private final Label qdrant = step("○  Qdrant Memory Runtime", false);
   private final Label memory = step("○  Memory Search Model", false);
   private final Label main = step("○  Main LLM", false);
-  private final Label tts = step("○  Fish Speech S2-Pro", false);
+  private final Label tts = step("○  CosyVoice TTS", false);
   private final TextArea log = new TextArea();
   private final Runnable retryAction;
   private final Runnable stopAction;
@@ -78,22 +78,22 @@ public final class StartupDialog {
   }
   public void mainReady(String name) { set(.96,name); main.setText("✓  Main LLM                  Готово"); UiStyles.ready(main); append("[llama] API server ready"); }
   public void ttsLoading() {
-    set(.97,"Fish Speech S2-Pro");
-    tts.setText("◉  Fish Speech S2-Pro          Загрузка...");
-    append("[tts] starting persistent Fish Speech runtime...");
+    set(.97,"CosyVoice TTS");
+    tts.setText("◉  CosyVoice TTS              Загрузка...");
+    append("[tts] starting persistent CosyVoice runtime...");
   }
   public void ttsReady() {
     set(.99,null);
-    tts.setText("✓  Fish Speech S2-Pro          Готово");
+    tts.setText("✓  CosyVoice TTS              Готово");
     UiStyles.ready(tts);
     append("[tts] model ready — persistent server");
   }
   public void ttsDisabled() {
-    tts.setText("–  Fish Speech S2-Pro          Отключён");
+    tts.setText("–  CosyVoice TTS              Отключён");
     append("[tts] disabled by configuration");
   }
   public void ttsFailed(String message) {
-    tts.setText("⚠  Fish Speech S2-Pro          Ошибка запуска");
+    tts.setText("⚠  CosyVoice TTS              Ошибка запуска");
     append("[tts] startup failed: " + message);
   }
   public void successAndClose() { set(1,"Система готова"); append("[system] all components are ready"); dialog.close(); }

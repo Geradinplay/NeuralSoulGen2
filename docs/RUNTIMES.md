@@ -9,7 +9,7 @@
 | llama.cpp (LLM, эмбеддинги, Web Search) | `runtime/llama/llama.exe` | 8080 / 8081 / 8082 | b9789 (b3ce5cedf) | github.com/ggml-org/llama.cpp |
 | whisper.cpp (распознавание речи) | `runtime/whisper/whisper-server.exe` | задан в конфиге STT | 1.9.5 | github.com/ggml-org/whisper.cpp |
 | Qdrant (долговременная память) | `runtime/data/qdrant.exe` | 6333 (+gRPC 6334) | 1.17.1 (eabee371) | github.com/qdrant/qdrant |
-| s2.cpp — Fish Speech S2 Pro (TTS) | `runtime/fish_speech_s2/s2-windows-{cpu,cuda,vulkan}/s2.exe` | задан в настройках Голоса (по умолчанию 5002) | пак коммита `adc43fb9` | github.com/rodrigomatta/s2.cpp |
+| CosyVoice (cosyvoice.cpp) — TTS | `runtime/cosyvoice/{cpu,cuda-12.4,cuda-13.5,vulkan}/cosyvoice-server.exe` | задан в настройках Голоса (по умолчанию 5020) | пак Lourdle/cosyvoice.cpp | github.com/Lourdle/cosyvoice.cpp |
 
 Все перечисленные пути игнорируются git'ом (см. `.gitignore`: `runtime/`, `model/`).
 
@@ -106,47 +106,71 @@ cargo build --release --bin qdrant
 
 ---
 
-## 4. s2.cpp — Fish Speech S2 Pro (озвучка ответов)
+## 4. CosyVoice (cosyvoice.cpp) — озвучка ответов
 
 ### Роли в приложении
 
-Пак из трёх бэкендов (выбирается в настройках Голоса):
+Пак из четырёх бэкендов (выбирается в настройках Голоса):
 
 | Папка | Бэкенд | Доп. флаг запуска |
 |---|---|---|
-| `runtime/fish_speech_s2/s2-windows-cpu/` | CPU | — |
-| `runtime/fish_speech_s2/s2-windows-cuda/` | NVIDIA | `-c 0` |
-| `runtime/fish_speech_s2/s2-windows-vulkan/` | AMD/Intel | `-v <индекс>` |
+| `runtime/cosyvoice/cpu/` | CPU | `--cpu` |
+| `runtime/cosyvoice/cuda-12.4/` | NVIDIA (CUDA 12) | `--cuda` |
+| `runtime/cosyvoice/cuda-13.5/` | NVIDIA (CUDA 13) | `--cuda` |
+| `runtime/cosyvoice/vulkan/` | AMD/Intel | `--backend vulkan<индекс>` |
 
-Приложение запускает сервер:
+Приложение запускает сервер (порт по умолчанию 5020, задан в настройках Голоса):
 
 ```
-s2.exe -m <путь к gguf> -t tokenizer.json --server -H 127.0.0.1 -P <порт>
+cosyvoice-server.exe -m <путь к gguf> --api --stream \
+  --served-model-name cosyvoice \
+  --voice-prompt <имя>=<prompt_speech.gguf> \
+  -H 127.0.0.1 -P 5020
 ```
 
-и общается по HTTP (PCM16, поток). gRPC приложение не использует — транспорт в настройках Голоса должен быть HTTP.
+и общается по OpenAI Speech API: `POST /v1/audio/speech` (JSON `model`, `input`, `voice`,
+`speed`, `temperature`, `top_p`, `top_k`, `chunk_tokens`, `stream:true`, `response_format:"wav"`).
+Ответ — поток WAV-байтов: 44-байтовый RIFF-заголовок в первом чанке, дальше сырой PCM16
+(CosyVoice3 ≈ 24 кГц mono).
 
 Файлы:
 
-- движок: `s2.exe`, `ggml*.dll`, CUDA/Vulkan-DLL и `tokenizer.json` — всё внутри пак-папки бэкенда
-- веса: `model/tts/fish_speech/s2-pro-q4_k_m.gguf` (не входит в пак, качается отдельно)
-- источник пака: `github.com/rodrigomatta/s2.cpp`, коммит `adc43fb9c161b53750133cea95385493f9e77f91`
-- GGUF-варианты: `huggingface.co/rodrigomt/s2-pro-gguf`
+- движок: `cosyvoice-server.exe`, `cosyvoice-cli.exe`, `quantize.exe`, `ggml*.dll` и CUDA/Vulkan-DLL — всё внутри пак-папки бэкенда
+- веса: `model/tts/cosyvoice/*.gguf` (не входят в пак, качаются отдельно)
+- источник пака: `github.com/Lourdle/cosyvoice.cpp` (MIT)
+- GGUF-веса: `huggingface.co/Lourdle/Fun-CosyVoice3-0.5B-2512-GGUF` (Apache-2.0)
+
+### Голос (prompt_speech)
+
+CosyVoice требует один раз предзакодировать голос-референс в `prompt_speech.gguf`:
+
+```bat
+runtime\cosyvoice\cuda-12.4\cosyvoice-cli.exe --frontend-only ^
+  --speech-tokenizer <путь>\speech_tokenizer.onnx ^
+  --campplus <путь>\campplus.onnx ^
+  --prompt-audio <референс.wav> ^
+  --prompt-text "Текст референса" ^
+  --prompt-speech-output model\tts\cosyvoice\prompts\nina.gguf
+```
+
+ONNX-файлы (speech-tokenizer, campplus) идут в комплекте с весами с HuggingFace.
+Сопоставление голос→файл сервер получает через `--voice-prompt имя=файл` при старте;
+приложение передаёт имя голоса из настроек Голоса в каждом запросе.
 
 ### Сборка из исходников
 
-Требуется: CMake ≥ 3.14, MSVC 2019+, CUDA Toolkit ≥ 12.4 (для CUDA-бэкенда), Vulkan SDK + `glslc` (для Vulkan).
+Требуется: CMake ≥ 3.14, MSVC 2019+, CUDA Toolkit 12.4 или 13.x (для CUDA-бэкенда), Vulkan SDK + `glslc` (для Vulkan).
 
 ```bat
-git clone --recurse-submodules https://github.com/rodrigomatta/s2.cpp.git
-cd s2.cpp
+git clone --recurse-submodules https://github.com/Lourdle/cosyvoice.cpp.git
+cd cosyvoice.cpp
 
 :: CUDA-бэкенд
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DS2_CUDA=ON
-cmake --build build --parallel
+cmake -B build-cuda -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+cmake --build build-cuda --parallel
 
 :: или Vulkan-бэкенд
-cmake -B build-vulkan -DCMAKE_BUILD_TYPE=Release -DS2_VULKAN=ON
+cmake -B build-vulkan -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
 cmake --build build-vulkan --parallel
 
 :: или CPU
@@ -154,11 +178,11 @@ cmake -B build-cpu -DCMAKE_BUILD_TYPE=Release
 cmake --build build-cpu --parallel
 ```
 
-Результат: `build/s2.exe` (плюс `s2.dll`/`ggml*.dll`). Структура пак-папки: положи `s2.exe`, собранные DLL и `tokenizer.json` из репозитория в папку бэкенда; веса остаются в `model/tts/fish_speech/`.
+Результат: `build*/cosyvoice-server.exe`, `cosyvoice-cli.exe`, `quantize.exe` (плюс `ggml*.dll`, CUDA/Vulkan-DLL). Разложи их по папкам `cpu`, `cuda-12.4`/`cuda-13.5`, `vulkan` в `runtime/cosyvoice/`.
 
-Простейший путь — не собирать, а взять готовый пак из релизов репозитория s2.cpp (CPU/CUDA/Vulkan уже собраны сообществом).
+Простейший путь — не собирать, а взять готовый пак из релизов репозитория cosyvoice.cpp.
 
-> ⚠️ Лицензия: веса Fish Audio S2 Pro — Fish Audio Research License (некоммерческое использование).
+> Лицензия: движок MIT, веса CosyVoice3 Apache-2.0 — коммерческое использование разрешено.
 
 ---
 
@@ -170,7 +194,7 @@ cmake --build build-cpu --parallel
 | `model/memory/` | bge-m3 Q4_K_S (эмбеддинги памяти) | llama.cpp (embedding-режим) |
 | `model/web_search/` | DR-Venus-4B-RL (генератор поисковых запросов) | llama.cpp |
 | `model/stt/whisper/` | whisper large-v3-turbo `.bin` | whisper.cpp |
-| `model/tts/fish_speech/` | s2-pro Q4_K_M GGUF | s2.cpp |
+| `model/tts/cosyvoice/` | CosyVoice3 0.5B GGUF + `prompts/*.gguf` (голоса) | cosyvoice.cpp |
 
 Папки `model/memory`, `model/web_search`, `model/stt`, `model/tts` — служебные: сканер моделей приложения не показывает их содержимое во вкладке «Модели» (см. `AppState.scanModels`).
 

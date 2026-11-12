@@ -163,8 +163,9 @@ public final class VoicePage extends VBox {
     wav.disableProperty().bind(state.busy.or(state.recording));
 
     TtsConfig tts = configs.tts();
-    Label ttsInfo = wrap("Модель: " + display(tts.model()) + "   ·   Voice: " + display(tts.voice())
-        + "   ·   Язык: " + display(tts.language()) + "   ·   Protocol: " + tts.protocol()
+    Label ttsInfo = wrap("Запасной TTS (используется, если CosyVoice выключен) — Модель: "
+        + display(tts.model()) + "   ·   Voice: " + display(tts.voice())
+        + "   ·   Protocol: " + tts.protocol()
         + "   ·   Endpoint: " + tts.endpoint().baseUrl() + tts.endpoint().path());
     TextField ttsText = new TextField("Привет! Я Нина, твой локальный помощник.");
     Button ttsTest = Ui.button("Проверить TTS", "voice", () -> speak.accept(ttsText.getText()));

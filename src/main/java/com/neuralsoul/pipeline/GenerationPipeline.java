@@ -342,18 +342,18 @@ Tool selection rules:
 
   private GenerationResult process(long id, String text, String model, String mode, Profile profile, boolean speak)
       throws Exception {
-    // The former speech flag belongs to the legacy Workspace voice toggle. The Fish Speech
+    // The former speech flag belongs to the legacy Workspace voice toggle. The CosyVoice
     // model card has its own persisted enable flag; respect it for *every* entry point
     // (typed chat, STT -> LLM and API requests), even when the old GUI toggle is off.
     boolean speakThisTurn = speak;
-    if (!speakThisTurn && services.tts() instanceof RoutingTtsService routing && routing.isFishEnabled()) {
+    if (!speakThisTurn && services.tts() instanceof RoutingTtsService routing && routing.isCosyEnabled()) {
       speakThisTurn = true;
-      System.out.println("[FishSpeech] LLM voice output enabled by Fish model settings (legacy voice toggle is off)");
+      System.out.println("[CosyVoice] LLM voice output enabled by CosyVoice model settings (legacy voice toggle is off)");
     }
     System.out.println("[TTS/Pipeline] generation=" + id + " speak=" + speakThisTurn);
     TtsTrace.log("g" + id, "REQUEST_GATE", "speakArgument=" + speak
         + " finalSpeak=" + speakThisTurn + " profile=" + profile
-        + " fishEnabled=" + (services.tts() instanceof RoutingTtsService routing && routing.isFishEnabled()));
+        + " cosyEnabled=" + (services.tts() instanceof RoutingTtsService routing && routing.isCosyEnabled()));
     ProfileMemoryService profiles = memory instanceof ProfileMemoryService p ? p : null;
     if (profiles != null) profiles.enter(profile);
     try {
@@ -437,7 +437,7 @@ Tool selection rules:
       // Speak text as it arrives. Tool calls cancel speculative speech immediately;
       // each iteration gets a fresh queue so discarded agent drafts never continue playing.
       StreamingSpeechQueue speechQueue = null;
-      if (speak && services.tts() instanceof RoutingTtsService routing && routing.isFishEnabled()) {
+      if (speak && services.tts() instanceof RoutingTtsService routing && routing.isCosyEnabled()) {
         SpeechGenerationSettingsStore.Common ttsOptions =
             new SpeechGenerationSettingsStore(configs.directory()).load().common();
         // Cold start happens once, before LLM streaming, avoiding queue overflow while the GGUF loads.
@@ -449,11 +449,11 @@ Tool selection rules:
           activeTtsQueue = speechQueue;
         } catch (Exception ttsStartError) {
           TtsTrace.log(ttsTraceId, "TTS_INITIALIZE_FAILED", message(ttsStartError));
-          System.err.println("[FishSpeech] startup failed: " + message(ttsStartError));
+          System.err.println("[CosyVoice] startup failed: " + message(ttsStartError));
         }
       } else {
         TtsTrace.log(ttsTraceId, "TTS_STREAM_SKIPPED", "speak=" + speak
-            + " fishEnabled=" + (services.tts() instanceof RoutingTtsService routing && routing.isFishEnabled()));
+            + " cosyEnabled=" + (services.tts() instanceof RoutingTtsService routing && routing.isCosyEnabled()));
       }
       final StreamingSpeechQueue activeSpeechQueue = speechQueue;
       StreamingMemoryToolFilter filter = new StreamingMemoryToolFilter(profile, ttsTraceId,
@@ -475,7 +475,7 @@ Tool selection rules:
         if (activeSpeechQueue != null) {
           // Let audio play concurrently with the final answer/bookkeeping.
           activeSpeechQueue.finish();
-          System.out.println("[FishSpeech/TTS] LLM stream complete; queued=" + activeSpeechQueue.submitted() + " phrases");
+          System.out.println("[CosyVoice/TTS] LLM stream complete; queued=" + activeSpeechQueue.submitted() + " phrases");
           TtsTrace.log(ttsTraceId, "LLM_TO_TTS_COMPLETE", "queuedPhrases=" + activeSpeechQueue.submitted());
           pendingSpeechQueue = activeSpeechQueue;
         }

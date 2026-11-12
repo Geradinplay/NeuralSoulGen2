@@ -12,52 +12,50 @@ import java.util.Properties;
  * Configuration for the pluggable TTS runtime.
  *
  * Kept separate from tts.properties so existing Coqui/OpenAI speech settings
- * remain available when Fish Speech is disabled.
- * Keys are separated into common.* and engine.fish.* namespaces, so new engines
+ * remain available when CosyVoice is disabled.
+ * Keys are separated into common.* and engine.cosy.* namespaces, so new engines
  * can own their own settings without changing the common streaming contract.
  */
 public final class SpeechGenerationSettingsStore {
-  public static final String FISH_S2 = "fish-s2";
+  public static final String COSYVOICE = "cosyvoice";
+  /** Legacy engine id read from old configs; mapped to COSYVOICE on load. */
+  public static final String LEGACY_FISH_S2 = "fish-s2";
   public static final String HTTP = "http";
-  public static final String GRPC = "grpc";
   public static final String CHUNKS = "chunks";
   public static final String INCREMENTAL = "incremental";
   // Default path is relative to the NeuralSoul working directory; never hard-code drive letters.
-  // {backend} resolves at runtime to cuda, vulkan or cpu, never to an absolute path.
-  public static final String DEFAULT_FISH_EXECUTABLE = "runtime/fish_speech_s2/s2-windows-{backend}/s2.exe";
-  public static final String LEGACY_FISH_EXECUTABLE = "runtime/tts/fish_speech/s2.exe";
-  public static final String OLD_FISH_EXECUTABLE = "runtime/fish_speech_s2-runtime-windows-x64/s2.exe";
-  public static final String DEFAULT_FISH_TOKENIZER = "auto";
-  public static final String LEGACY_FISH_TOKENIZER = "model/tts/fish_speech/tokenizer.json";
+  // {backend} resolves at runtime to a portable pack folder: cpu, cuda-12.4, cuda-13.5 or vulkan.
+  public static final String DEFAULT_COSY_EXECUTABLE = "runtime/cosyvoice/{backend}/cosyvoice-server.exe";
+  public static final String DEFAULT_MODEL = "model/tts/cosyvoice/cosyvoice-0.5b-q4_k_m.gguf";
+  public static final String DEFAULT_VOICE = "default";
+  public static final String SERVED_MODEL_NAME = "cosyvoice";
 
   public record Common(
       boolean enabled, String engineId, String transport, String textInputMode,
       int minChunkCharacters, int maxChunkCharacters, int flushDelayMs, int queueLimit,
-      int playbackStartBufferMs, boolean lowLatency, int decodeStrideFrames,
-      int holdbackFrames, boolean segmentSentences, int sentencePauseMs) {
+      int playbackStartBufferMs) {
     public static Common defaults() {
-      return new Common(false, FISH_S2, HTTP, CHUNKS, 24, 180, 220, 8,
-          400, true, 4, 0, false, 180);
+      return new Common(false, COSYVOICE, HTTP, CHUNKS, 24, 180, 220, 8, 400);
     }
   }
 
-  public record Fish(
-      String executablePath, String modelPath, String tokenizerPath, String backend,
-      int deviceIndex, int cpuThreads, String host, int httpPort, int grpcPort,
-      String voice, String referenceAudio, String referenceText,
-      double temperature, double topP, int topK, int maxTokens, String runtimePreference) {
-    public static Fish defaults() {
-      return new Fish(
-          DEFAULT_FISH_EXECUTABLE,
-          "model/tts/fish_speech/s2-pro-q4_k_m.gguf",
-          DEFAULT_FISH_TOKENIZER,
-          "AUTO", 0, 8, "127.0.0.1", 3030, 3031, "", "", "", 0.8, 0.8, 30, 1024,
-          "VULKAN");
+  public record Cosy(
+      String executablePath, String modelPath, String voice, String voicePromptPath,
+      String referenceWavPath, String referenceText,
+      String backend, String cudaPack, int deviceIndex, int cpuThreads, String host, int httpPort,
+      double temperature, double topP, int topK, double speed, int chunkTokens) {
+    public static Cosy defaults() {
+      return new Cosy(
+          DEFAULT_COSY_EXECUTABLE,
+          DEFAULT_MODEL,
+          DEFAULT_VOICE, "", "", "",
+          "AUTO", "auto", 0, 8, "127.0.0.1", 5020,
+          0.8, 0.8, 50, 1.0, 0);
     }
   }
 
-  public record Settings(Common common, Fish fish) {
-    public static Settings defaults() { return new Settings(Common.defaults(), Fish.defaults()); }
+  public record Settings(Common common, Cosy cosy) {
+    public static Settings defaults() { return new Settings(Common.defaults(), Cosy.defaults()); }
   }
 
   private final Path path;
@@ -76,61 +74,47 @@ public final class SpeechGenerationSettingsStore {
     Common d = Common.defaults();
     Common common = new Common(
         bool(props, "common.enabled", d.enabled()),
-        str(props, "common.engine", d.engineId()),
-        str(props, "common.transport", d.transport()),
+        migrateEngine(str(props, "common.engine", d.engineId())),
+        HTTP,
         str(props, "common.text-input", d.textInputMode()),
         integer(props, "common.min-chunk-chars", d.minChunkCharacters()),
         integer(props, "common.max-chunk-chars", d.maxChunkCharacters()),
         integer(props, "common.flush-delay-ms", d.flushDelayMs()),
         integer(props, "common.queue-limit", d.queueLimit()),
-        integer(props, "common.playback-start-buffer-ms", d.playbackStartBufferMs()),
-        bool(props, "common.low-latency", d.lowLatency()),
-        integer(props, "common.decode-stride-frames", d.decodeStrideFrames()),
-        integer(props, "common.holdback-frames", d.holdbackFrames()),
-        bool(props, "common.segment-sentences", d.segmentSentences()),
-        integer(props, "common.sentence-pause-ms", d.sentencePauseMs()));
-    Fish f = Fish.defaults();
-    Fish fish = new Fish(
-        migrateLegacyExecutable(str(props, "engine.fish.executable", f.executablePath())),
-        str(props, "engine.fish.model", f.modelPath()),
-        migrateLegacyTokenizer(str(props, "engine.fish.tokenizer", f.tokenizerPath())),
-        str(props, "engine.fish.backend", f.backend()),
-        integer(props, "engine.fish.device-index", f.deviceIndex()),
-        integer(props, "engine.fish.cpu-threads", f.cpuThreads()),
-        str(props, "engine.fish.host", f.host()),
-        integer(props, "engine.fish.http-port", f.httpPort()),
-        integer(props, "engine.fish.grpc-port", f.grpcPort()),
-        str(props, "engine.fish.voice", f.voice()),
-        str(props, "engine.fish.reference-audio", f.referenceAudio()),
-        str(props, "engine.fish.reference-text", f.referenceText()),
-        decimal(props, "engine.fish.temperature", f.temperature()),
-        decimal(props, "engine.fish.top-p", f.topP()),
-        integer(props, "engine.fish.top-k", f.topK()),
-        integer(props, "engine.fish.max-tokens", f.maxTokens()),
-        str(props, "engine.fish.runtime", legacyRuntime(props, f.runtimePreference())));
-    return new Settings(common, fish);
+        integer(props, "common.playback-start-buffer-ms", d.playbackStartBufferMs()));
+    Cosy c = Cosy.defaults();
+    Cosy cosy = new Cosy(
+        str(props, "engine.cosy.executable", c.executablePath()),
+        str(props, "engine.cosy.model", c.modelPath()),
+        str(props, "engine.cosy.voice", c.voice()),
+        str(props, "engine.cosy.voice-prompt", c.voicePromptPath()),
+        str(props, "engine.cosy.reference-wav", c.referenceWavPath()),
+        str(props, "engine.cosy.reference-text", c.referenceText()),
+        str(props, "engine.cosy.backend", c.backend()),
+        str(props, "engine.cosy.cuda-pack", c.cudaPack()),
+        integer(props, "engine.cosy.device-index", c.deviceIndex()),
+        integer(props, "engine.cosy.cpu-threads", c.cpuThreads()),
+        str(props, "engine.cosy.host", c.host()),
+        integer(props, "engine.cosy.http-port", c.httpPort()),
+        decimal(props, "engine.cosy.temperature", c.temperature()),
+        decimal(props, "engine.cosy.top-p", c.topP()),
+        integer(props, "engine.cosy.top-k", c.topK()),
+        decimal(props, "engine.cosy.speed", c.speed()),
+        integer(props, "engine.cosy.chunk-tokens", c.chunkTokens()));
+    return new Settings(common, cosy);
   }
 
-  /** A previously saved default must not override the new project-relative runtime layout. */
-  private static String migrateLegacyExecutable(String configured) {
-    if (configured == null) return DEFAULT_FISH_EXECUTABLE;
-    String normalized = configured.replace('\\', '/');
-    if (normalized.equals(LEGACY_FISH_EXECUTABLE) || normalized.equals(OLD_FISH_EXECUTABLE))
-      return DEFAULT_FISH_EXECUTABLE;
-    return configured;
-  }
-
-  /** Older versions kept tokenizer.json alongside the GGUF; new portable runtimes bundle it. */
-  private static String migrateLegacyTokenizer(String configured) {
-    if (configured == null || configured.isBlank()) return DEFAULT_FISH_TOKENIZER;
-    if (configured.replace('\\', '/').equals(LEGACY_FISH_TOKENIZER)) return DEFAULT_FISH_TOKENIZER;
+  /** Fish Speech was removed; a saved fish engine id now means CosyVoice. */
+  private static String migrateEngine(String configured) {
+    if (configured == null || configured.isBlank() || LEGACY_FISH_S2.equals(configured))
+      return COSYVOICE;
     return configured;
   }
 
   public synchronized void save(Settings settings) throws IOException {
     validate(settings);
     Common c = settings.common();
-    Fish f = settings.fish();
+    Cosy cosy = settings.cosy();
     Properties p = new Properties();
     put(p, "common.enabled", c.enabled());
     put(p, "common.engine", c.engineId());
@@ -141,28 +125,23 @@ public final class SpeechGenerationSettingsStore {
     put(p, "common.flush-delay-ms", c.flushDelayMs());
     put(p, "common.queue-limit", c.queueLimit());
     put(p, "common.playback-start-buffer-ms", c.playbackStartBufferMs());
-    put(p, "common.low-latency", c.lowLatency());
-    put(p, "common.decode-stride-frames", c.decodeStrideFrames());
-    put(p, "common.holdback-frames", c.holdbackFrames());
-    put(p, "common.segment-sentences", c.segmentSentences());
-    put(p, "common.sentence-pause-ms", c.sentencePauseMs());
-    put(p, "engine.fish.executable", f.executablePath());
-    put(p, "engine.fish.model", f.modelPath());
-    put(p, "engine.fish.tokenizer", f.tokenizerPath());
-    put(p, "engine.fish.backend", f.backend());
-    put(p, "engine.fish.runtime", f.runtimePreference());
-    put(p, "engine.fish.device-index", f.deviceIndex());
-    put(p, "engine.fish.cpu-threads", f.cpuThreads());
-    put(p, "engine.fish.host", f.host());
-    put(p, "engine.fish.http-port", f.httpPort());
-    put(p, "engine.fish.grpc-port", f.grpcPort());
-    put(p, "engine.fish.voice", f.voice());
-    put(p, "engine.fish.reference-audio", f.referenceAudio());
-    put(p, "engine.fish.reference-text", f.referenceText());
-    put(p, "engine.fish.temperature", f.temperature());
-    put(p, "engine.fish.top-p", f.topP());
-    put(p, "engine.fish.top-k", f.topK());
-    put(p, "engine.fish.max-tokens", f.maxTokens());
+    put(p, "engine.cosy.executable", cosy.executablePath());
+    put(p, "engine.cosy.model", cosy.modelPath());
+    put(p, "engine.cosy.voice", cosy.voice());
+    put(p, "engine.cosy.voice-prompt", cosy.voicePromptPath());
+    put(p, "engine.cosy.reference-wav", cosy.referenceWavPath());
+    put(p, "engine.cosy.reference-text", cosy.referenceText());
+    put(p, "engine.cosy.backend", cosy.backend());
+    put(p, "engine.cosy.cuda-pack", cosy.cudaPack());
+    put(p, "engine.cosy.device-index", cosy.deviceIndex());
+    put(p, "engine.cosy.cpu-threads", cosy.cpuThreads());
+    put(p, "engine.cosy.host", cosy.host());
+    put(p, "engine.cosy.http-port", cosy.httpPort());
+    put(p, "engine.cosy.temperature", cosy.temperature());
+    put(p, "engine.cosy.top-p", cosy.topP());
+    put(p, "engine.cosy.top-k", cosy.topK());
+    put(p, "engine.cosy.speed", cosy.speed());
+    put(p, "engine.cosy.chunk-tokens", cosy.chunkTokens());
 
     Files.createDirectories(path.getParent());
     Path tmp = path.resolveSibling(path.getFileName() + ".tmp");
@@ -182,10 +161,9 @@ public final class SpeechGenerationSettingsStore {
 
   public static void validate(Settings s) {
     Common c = s.common();
-    Fish f = s.fish();
-    if (!FISH_S2.equals(c.engineId())) throw new IllegalArgumentException("Неизвестный TTS-движок");
-    if (!HTTP.equals(c.transport()) && !GRPC.equals(c.transport()))
-      throw new IllegalArgumentException("Неизвестный транспорт");
+    Cosy f = s.cosy();
+    if (!COSYVOICE.equals(c.engineId())) throw new IllegalArgumentException("Неизвестный TTS-движок");
+    if (!HTTP.equals(c.transport())) throw new IllegalArgumentException("Неизвестный транспорт");
     if (!CHUNKS.equals(c.textInputMode()) && !INCREMENTAL.equals(c.textInputMode()))
       throw new IllegalArgumentException("Неизвестный режим входного текста");
     if (c.minChunkCharacters() < 1 || c.maxChunkCharacters() < c.minChunkCharacters() || c.maxChunkCharacters() > 10000)
@@ -193,28 +171,27 @@ public final class SpeechGenerationSettingsStore {
     inRange("Задержка отправки чанка", c.flushDelayMs(), 0, 30000);
     inRange("Очередь чанков", c.queueLimit(), 1, 256);
     inRange("Буфер воспроизведения", c.playbackStartBufferMs(), 0, 30000);
-    inRange("Шаг аудиодекодера", c.decodeStrideFrames(), 0, 128);
-    inRange("Удержание кадров", c.holdbackFrames(), -1, 128);
-    inRange("Пауза между предложениями", c.sentencePauseMs(), 0, 5000);
     if (!java.util.Set.of("AUTO", "CPU", "CUDA", "VULKAN").contains(f.backend()))
-      throw new IllegalArgumentException("Неизвестное устройство Fish Speech");
-    if (!java.util.Set.of("CUDA", "VULKAN").contains(f.runtimePreference()))
-      throw new IllegalArgumentException("TTS runtime должен быть CUDA или Vulkan");
+      throw new IllegalArgumentException("Неизвестное устройство CosyVoice");
+    if (!java.util.Set.of("auto", "cuda-13.5", "cuda-12.4").contains(f.cudaPack()))
+      throw new IllegalArgumentException("Неизвестная сборка CUDA для CosyVoice");
     inRange("GPU index", f.deviceIndex(), 0, 32);
     inRange("CPU threads", f.cpuThreads(), 1, 256);
     inRange("HTTP port", f.httpPort(), 1, 65535);
-    inRange("gRPC port", f.grpcPort(), 1, 65535);
     if (f.host().isBlank()) throw new IllegalArgumentException("Адрес сервера не указан");
     if (!Double.isFinite(f.temperature()) || f.temperature() <= 0 || f.temperature() > 4)
       throw new IllegalArgumentException("Temperature: 0–4 (не включая 0)");
     if (!Double.isFinite(f.topP()) || f.topP() <= 0 || f.topP() > 1)
       throw new IllegalArgumentException("Top-p: 0–1 (не включая 0)");
-    inRange("Top-k", f.topK(), 1, 1000);
-    inRange("Max tokens", f.maxTokens(), 1, 32768);
+    inRange("Top-k", f.topK(), 0, 1000);
+    if (!Double.isFinite(f.speed()) || f.speed() <= 0 || f.speed() > 4)
+      throw new IllegalArgumentException("Speed: 0–4 (не включая 0)");
+    inRange("Chunk tokens", f.chunkTokens(), 0, 8192);
     requireRelative("EXE", f.executablePath());
     requireRelative("GGUF", f.modelPath());
-    requireRelative("Tokenizer", f.tokenizerPath());
-    if (!f.referenceAudio().isBlank()) requireRelative("Reference audio", f.referenceAudio());
+    if (f.voice().isBlank()) throw new IllegalArgumentException("Имя голоса не указано");
+    if (!f.voicePromptPath().isBlank()) requireRelative("Prompt speech", f.voicePromptPath());
+    if (!f.referenceWavPath().isBlank()) requireRelative("Reference WAV", f.referenceWavPath());
   }
 
   private static void requireRelative(String name, String raw) {
@@ -222,11 +199,6 @@ public final class SpeechGenerationSettingsStore {
     Path path = Path.of(raw);
     if (path.isAbsolute() || raw.matches("(?i)^[a-z]:.*") || path.normalize().startsWith(".."))
       throw new IllegalArgumentException(name + ": укажи путь относительно каталога NeuralSoul");
-  }
-
-  private static String legacyRuntime(Properties props, String fallback) {
-    String legacy = props.getProperty("engine.fish.backend", "").strip();
-    return "CUDA".equals(legacy) || "VULKAN".equals(legacy) ? legacy : fallback;
   }
 
   private static void inRange(String label, int v, int lo, int hi) {

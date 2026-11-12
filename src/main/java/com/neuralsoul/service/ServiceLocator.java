@@ -6,7 +6,7 @@ import com.neuralsoul.service.audio.*;
 import com.neuralsoul.service.http.*;
 import java.util.List;
 import java.util.function.Supplier;
-import com.neuralsoul.service.tts.FishSpeechTtsService;
+import com.neuralsoul.service.tts.CosyVoiceTtsService;
 import com.neuralsoul.service.tts.RoutingTtsService;
 import com.neuralsoul.config.SpeechGenerationSettingsStore;
 
@@ -25,8 +25,8 @@ public final class ServiceLocator implements AutoCloseable {
   private volatile AudioPlayer player;
   private volatile AudioRecorder recorder;
   private volatile boolean initialized;
-  private volatile Supplier<List<FishSpeechTtsService.AllowedDevice>> ttsDevices = List::of;
-  public synchronized void setTtsDevices(Supplier<List<FishSpeechTtsService.AllowedDevice>> supplier) {
+  private volatile Supplier<List<CosyVoiceTtsService.AllowedDevice>> ttsDevices = List::of;
+  public synchronized void setTtsDevices(Supplier<List<CosyVoiceTtsService.AllowedDevice>> supplier) {
     this.ttsDevices = supplier == null ? List::of : supplier;
   }
 
@@ -58,7 +58,7 @@ public final class ServiceLocator implements AutoCloseable {
     SpeechGenerationSettingsStore ttsStore = new SpeechGenerationSettingsStore(configs.directory());
     tts = new RoutingTtsService(
         new HttpTtsService(configs::tts, http),
-        new FishSpeechTtsService(ttsStore, ttsDevices), ttsStore);
+        new CosyVoiceTtsService(ttsStore, ttsDevices), ttsStore);
     player = new JavaSoundPlayer(configs);
     recorder = new JavaSoundRecorder(() -> configs.pipeline().microphoneSeconds(), configs);
 

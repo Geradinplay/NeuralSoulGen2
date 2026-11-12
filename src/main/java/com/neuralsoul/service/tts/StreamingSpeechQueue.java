@@ -39,7 +39,7 @@ public final class StreamingSpeechQueue implements AutoCloseable {
     TtsTrace.log(this.traceId, "QUEUE_CREATED", "minChars=" + config.minChunkCharacters()
         + " maxChars=" + config.maxChunkCharacters() + " limit=" + config.queueLimit()
         + " flushDelayMs=" + config.flushDelayMs());
-    worker = new Thread(this::work, "fish-tts-stream-queue");
+    worker = new Thread(this::work, "tts-stream-queue");
     worker.setDaemon(true);
     worker.start();
   }
@@ -172,7 +172,7 @@ public final class StreamingSpeechQueue implements AutoCloseable {
         error = e;
         TtsTrace.log(traceId, "QUEUE_WORKER_FAILED", e.getClass().getSimpleName()
             + ": " + e.getMessage() + " processed=" + processed);
-        System.err.println("[FishSpeech/TTS] synthesis/playback failed: " + e);
+        System.err.println("[CosyVoice/TTS] synthesis/playback failed: " + e);
         player.cancelSpeech();
       }
     }
