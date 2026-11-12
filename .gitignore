@@ -1,23 +1,23 @@
 # Сборка Maven
-target/
+/target/
 *.class
 
 # IDE
-.idea/
+/.idea/
 *.iml
-.vscode/
+/.vscode/
 
 # Модели (GGUF и прочие веса — гигабайты)
-model/
+/model/
 
 # Рантаймы (llama.cpp, Qdrant, FishSpeech, whisper — бинари)
-runtime/
+/runtime/
 
 # Данные приложения (память диалогов — личные данные)
-data/
+/data/
 
 # Логи
-logs/
+/logs/
 *.log
 
 # Служебное

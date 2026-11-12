@@ -1,6 +1,7 @@
 package com.neuralsoul.ui.components;
 
 import javafx.geometry.*;
+import com.neuralsoul.runtime.ModelLaunch;
 import com.neuralsoul.ui.styles.UiStyles;
 import javafx.scene.*;
 import javafx.scene.control.*;
@@ -17,10 +18,6 @@ public final class StartupDialog {
   private final Label model = label("Подготовка компонентов", 14, "#ded9eb");
   private final Label percent = label("0%", 14, "#f4f1ff");
   private final ProgressBar progress = new ProgressBar(0);
-  private final Label qdrant = step("○  Qdrant Memory Runtime", false);
-  private final Label memory = step("○  Memory Search Model", false);
-  private final Label main = step("○  Main LLM", false);
-  private final Label tts = step("○  CosyVoice TTS", false);
   private final TextArea log = new TextArea();
   private final Runnable retryAction;
   private final Runnable stopAction;
@@ -50,51 +47,46 @@ public final class StartupDialog {
       if (stopAction != null) stopAction.run();
     });
     HBox stopRow = new HBox(new Region(), emergencyStop); HBox.setHgrow(stopRow.getChildren().get(0), Priority.ALWAYS);
-    VBox body = new VBox(12, title, top, progress, qdrant, memory, main, tts, log, stopRow);
+    // The runtime list is dynamic and belongs in the log. No fixed Qdrant/Main/TTS
+    // rows: the startup plan is the single source of truth for what actually starts.
+    VBox body = new VBox(12, title, top, progress, log, stopRow);
     root.getChildren().addAll(header, body);
     root.setPadding(new Insets(20, 24, 22, 24));
     UiStyles.startupPanel(root, false); root.setEffect(new DropShadow(28, Color.rgb(35,20,70,.35)));
-    Scene scene = new Scene(root, 500, 545); scene.setFill(Color.TRANSPARENT); dialog.setScene(scene);
+    Scene scene = new Scene(root, 500, 430); scene.setFill(Color.TRANSPARENT); dialog.setScene(scene);
     dialog.setOnCloseRequest(e -> { if (!failed) e.consume(); });
   }
 
   private static Label label(String s, int size, String color) { Label l=new Label(s); UiStyles.label(l,size,color); return l; }
-  private static Label step(String s, boolean ok) { Label l=label(s,14,ok?"#e8e3f3":"#aaa5b7"); l.setPadding(new Insets(4,0,4,4)); return l; }
   private void append(String s) { log.appendText(s + "\n"); log.positionCaret(log.getLength()); }
   private void set(double p, String name) { progress.setProgress(p); percent.setText((int)Math.round(p*100)+"%"); if(name!=null) model.setText(name); }
 
   public void show() { dialog.show(); }
   public void close() { dialog.close(); }
-  public void qdrantLoading() { set(.08,"Qdrant Memory Runtime"); qdrant.setText("◉  Qdrant Memory Runtime     Запуск..."); append("[qdrant] starting local memory runtime..."); }
-  public void qdrantReady() { set(.18,null); qdrant.setText("✓  Qdrant Memory Runtime     Готово"); UiStyles.ready(qdrant); append("[qdrant] ready"); }
-  public void memoryDisabled() { set(.34,"Memory Search отключён"); memory.setText("–  Memory Search Model       Отключён"); append("[memory] semantic model disabled"); }
-  public void memoryLoading(String name) { set(.28,"Memory Search Model ("+name+")"); memory.setText("◉  Memory Search Model       Загрузка..."); append("[memory] loading " + name); }
-  public void memoryReady() { set(.42,null); memory.setText("✓  Memory Search Model       Готово"); UiStyles.ready(memory); append("[memory] model ready"); }
-  public void mainLoading(String name, int usedMb, int ignored) {
-    double p = progress.getProgress(); if (p < .48) p=.48; else p=Math.min(.94,p+.015); set(p,name);
-    main.setText("◉  Main LLM                  Загрузка...");
-    if (usedMb > 0) append("[llama] loading tensors... process memory: " + usedMb + " MB");
-    else append("[llama] initializing llama.cpp for " + name);
+  public void planReady(java.util.List<ModelLaunch<?, ?>> launches) {
+    append("[startup] plan contains " + launches.size() + " runtime(s)");
+    for (ModelLaunch<?, ?> launch : launches) {
+      String path = launch.modelPath() == null ? "" : " · " + launch.modelPath();
+      append("[plan] " + launch.runtimeKey() + " · " + launch.displayName() + path);
+    }
   }
-  public void mainReady(String name) { set(.96,name); main.setText("✓  Main LLM                  Готово"); UiStyles.ready(main); append("[llama] API server ready"); }
-  public void ttsLoading() {
-    set(.97,"CosyVoice TTS");
-    tts.setText("◉  CosyVoice TTS              Загрузка...");
-    append("[tts] starting persistent CosyVoice runtime...");
+  public void modelStarting(ModelLaunch<?, ?> launch, int index, int total) {
+    double p = total == 0 ? 0 : (double) (index - 1) / total;
+    set(p, launch.displayName());
+    String path = launch.modelPath() == null ? "" : " · " + launch.modelPath();
+    append("[" + launch.runtimeKey().name().toLowerCase() + "] starting "
+        + launch.displayName() + path);
   }
-  public void ttsReady() {
-    set(.99,null);
-    tts.setText("✓  CosyVoice TTS              Готово");
-    UiStyles.ready(tts);
-    append("[tts] model ready — persistent server");
+  public void modelReady(ModelLaunch<?, ?> launch, int index, int total) {
+    set(total == 0 ? 1 : (double) index / total, launch.displayName());
+    append("[" + launch.runtimeKey().name().toLowerCase() + "] ready · " + launch.displayName());
   }
-  public void ttsDisabled() {
-    tts.setText("–  CosyVoice TTS              Отключён");
-    append("[tts] disabled by configuration");
-  }
-  public void ttsFailed(String message) {
-    tts.setText("⚠  CosyVoice TTS              Ошибка запуска");
-    append("[tts] startup failed: " + message);
+  public void modelFailed(ModelLaunch<?, ?> launch, int index, int total, Throwable error) {
+    double p = total == 0 ? 0 : (double) index / total;
+    set(p, launch.displayName());
+    append("[" + launch.runtimeKey().name().toLowerCase() + "] "
+        + (launch.optional() ? "optional failure" : "FAILED") + " · "
+        + (error.getMessage() == null ? error.toString() : error.getMessage()));
   }
   public void successAndClose() { set(1,"Система готова"); append("[system] all components are ready"); dialog.close(); }
   public void fail(String stage, Throwable t) {

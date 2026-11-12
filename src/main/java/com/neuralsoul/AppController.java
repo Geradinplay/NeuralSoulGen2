@@ -25,6 +25,8 @@ import javafx.scene.layout.*;
 import javafx.stage.*;
 
 public final class AppController implements AutoCloseable {
+  private record MemoryLaunchSettings(int threads, java.nio.file.Path modelPath, String device,
+                                      boolean automatic, boolean allowRamOffload) {}
   private final Stage stage;
   private final AppState state;
   private final AssistantBackend backend;
@@ -419,13 +421,6 @@ public final class AppController implements AutoCloseable {
                 System.out.println("[System] Saving settings...");
                 store.save(state);
                 checkStartupCancelled(startupCancelled);
-                startupStage[0] = "Запуск Qdrant";
-                startupStatus("Запуск Qdrant…");
-                Platform.runLater(startupDialog::qdrantLoading);
-                System.out.println("[System] Starting Qdrant memory runtime...");
-                qdrantRuntime.start();
-                checkStartupCancelled(startupCancelled);
-                Platform.runLater(startupDialog::qdrantReady);
                 ModelAssignment memoryModel = state.models.stream()
                     .filter(m -> m.memoryOnly && m.enabled.get())
                     .findFirst().orElse(null);
@@ -436,93 +431,121 @@ public final class AppController implements AutoCloseable {
                     if (service instanceof QdrantMemoryService q) q.setSemanticEnabled(semanticMemory);
                   }
                 } else if (memory instanceof QdrantMemoryService q) q.setSemanticEnabled(semanticMemory);
-                if (semanticMemory) {
-                  java.nio.file.Path memoryPath = java.nio.file.Path.of(
-                      System.getProperty("user.dir"), "model").resolve(memoryModel.fileName).normalize();
-                  System.out.println("[System] Starting Memory Search model: " + memoryPath);
-                  startupStage[0] = "Загрузка Memory Search";
-                  startupStatus("Загрузка Memory Search…");
-                  Platform.runLater(() -> startupDialog.memoryLoading(memoryModel.name));
-                  String memoryDevice = state.automatic.get()
-                      ? placementPlan.device(AutomaticModelPlacement.Purpose.MEMORY,
-                          memoryModel.fileName, memoryModel.device.get())
-                      : memoryModel.device.get();
-                  memoryEmbeddingRuntime.start(
-                      Math.max(1, (int)Math.round(state.threads.get())), memoryPath, memoryDevice,
-                      state.automatic.get(), state.allowRamOffload.get());
-                  checkStartupCancelled(startupCancelled);
-                  Platform.runLater(startupDialog::memoryReady);
-                } else {
-                  Platform.runLater(startupDialog::memoryDisabled);
-                  System.out.println("[System] Memory Search model disabled; FAST memory remains active");
-                }
                 // Qdrant storage is persistent. Re-indexing every memory on every application start
                 // is both redundant and extremely expensive when semantic memory is enabled because
                 // every record would be embedded through BGE-M3 again. Explicit import/refresh actions
                 // still call MemoryService.synchronize() when a rebuild is actually requested.
                 System.out.println("[System] Skipping full memory re-index on startup (persistent Qdrant)");
-                startupStage[0] = "Загрузка Main LLM";
-                startupStatus("Загрузка Main LLM…");
-                Platform.runLater(() -> startupDialog.mainLoading(config.name(), 0, 0));
-                System.out.println("[System] Starting model runtime...");
-                checkStartupCancelled(startupCancelled);
-                runtime.start(config);
-                checkStartupCancelled(startupCancelled);
-                Platform.runLater(() -> startupDialog.mainReady(config.name()));
-
-                startupStage[0] = "Загрузка суммаризации контекста";
-                startupStatus("Загрузка модели суммаризации контекста…");
-                System.out.println("[System] Starting context summarization: " + summarizationConfig.displayName());
-                summarizationRuntime.start(summarizationConfig);
-                checkStartupCancelled(startupCancelled);
-
-                // Voice is optional for the core assistant. Keep Whisper resident for low-latency
-                // STT, but a missing/unsupported Whisper runtime must not prevent Main LLM startup.
                 SttConfig startupStt = store.configs().stt();
+                ModelStartupPlan startupPlan = new ModelStartupPlan(runtimeLifecycle.registry());
+                startupPlan.add(new ModelLaunch<>(RuntimeKey.QDRANT, QdrantRuntimeManager.class,
+                    "Qdrant Memory Runtime", null, (Void) null, false,
+                    (selectedRuntime, ignored) -> selectedRuntime.start()));
+
+                if (semanticMemory) {
+                  java.nio.file.Path memoryPath = java.nio.file.Path.of(
+                      System.getProperty("user.dir"), "model").resolve(memoryModel.fileName).normalize();
+                  String memoryDevice = state.automatic.get()
+                      ? placementPlan.device(AutomaticModelPlacement.Purpose.MEMORY,
+                          memoryModel.fileName, memoryModel.device.get())
+                      : memoryModel.device.get();
+                  MemoryLaunchSettings memorySettings = new MemoryLaunchSettings(
+                      Math.max(1, (int)Math.round(state.threads.get())), memoryPath, memoryDevice,
+                      state.automatic.get(), state.allowRamOffload.get());
+                  startupPlan.add(new ModelLaunch<>(RuntimeKey.MEMORY_SEARCH,
+                      MemoryEmbeddingRuntimeManager.class, memoryModel.name, memoryPath,
+                      memorySettings, false, (selectedRuntime, settings) -> selectedRuntime.start(
+                          settings.threads(), settings.modelPath(), settings.device(),
+                          settings.automatic(), settings.allowRamOffload())));
+                } else {
+                  memoryEmbeddingRuntime.stop();
+                  System.out.println("[System] Memory Search model disabled; FAST memory remains active");
+                }
+
+                startupPlan.add(new ModelLaunch<>(RuntimeKey.MAIN_LLM, ModelRuntimeManager.class,
+                    config.name(), config.modelPath(), config, false,
+                    ModelRuntimeManager::start));
+
+                startupPlan.add(new ModelLaunch<>(RuntimeKey.SUMMARIZATION,
+                    SummarizationRuntimeManager.class, summarizationConfig.displayName(),
+                    summarizationConfig.config() == null ? config.modelPath()
+                        : summarizationConfig.config().modelPath(),
+                    summarizationConfig, false, SummarizationRuntimeManager::start));
+
                 if (startupStt.runtimeEnabled()) {
-                  try {
-                    startupStage[0] = "Загрузка Whisper STT";
-                    startupStatus("Загрузка Whisper STT…");
-                    whisperRuntime.start(startupStt);
-                    checkStartupCancelled(startupCancelled);
-                  } catch (Exception voiceError) {
-                    System.out.println("[Whisper] optional startup failed: " + voiceError);
-                    voiceError.printStackTrace(System.out);
-                  }
+                  startupPlan.add(new ModelLaunch<>(RuntimeKey.WHISPER_STT,
+                      WhisperRuntimeManager.class, java.nio.file.Path.of(startupStt.modelPath()).getFileName().toString(),
+                      java.nio.file.Path.of(startupStt.modelPath()), startupStt, true,
+                      WhisperRuntimeManager::start));
+                } else {
+                  whisperRuntime.stop();
                 }
 
                 if (webSearchConfig != null) {
-                  startupStage[0] = "Загрузка Web Reasoning";
-                  startupStatus("Загрузка Web Reasoning…");
-                  System.out.println("[System] Starting Web Reasoning: " + webReasoningConfig.displayName());
-                  webReasoningRuntime.start(webReasoningConfig);
-                  checkStartupCancelled(startupCancelled);
-
-                  startupStage[0] = "Загрузка Web Search";
-                  startupStatus("Загрузка Web Search…");
-                  System.out.println("[System] Starting Web Search model: " + webSearchConfig.modelPath());
-                  webSearchRuntime.start(webSearchConfig);
-                  checkStartupCancelled(startupCancelled);
-                  webSearchAgent.configure(webSearchConfig.name(), webSearchConfig.maxOutputTokens(),
-                      webReasoningRuntime.service(), webReasoningConfig.displayName());
-                  System.out.println("[System] Web Search Agent ready; reasoning="
-                      + webReasoningConfig.displayName());
+                  startupPlan.add(new ModelLaunch<>(RuntimeKey.WEB_REASONING,
+                      WebReasoningRuntimeManager.class, webReasoningConfig.displayName(),
+                      webReasoningConfig.config() == null ? null : webReasoningConfig.config().modelPath(),
+                      webReasoningConfig, false, WebReasoningRuntimeManager::start));
+                  startupPlan.add(new ModelLaunch<>(RuntimeKey.WEB_SEARCH,
+                      WebSearchRuntimeManager.class, webSearchConfig.name(), webSearchConfig.modelPath(),
+                      webSearchConfig, false, WebSearchRuntimeManager::start));
                 } else {
                   webSearchAgent.close();
                   webReasoningRuntime.stop();
+                  webSearchRuntime.stop();
                   System.out.println("[System] Web Search role is not assigned; agent disabled");
                 }
 
                 if (!generalConfigs.isEmpty()) {
-                  startupStage[0] = "Загрузка General Agents";
-                  startupStatus("Загрузка General Agents…");
-                  System.out.println("[System] Starting " + generalConfigs.size() + " General model(s)...");
-                  generalAgentRuntime.startAll(generalConfigs);
-                  checkStartupCancelled(startupCancelled);
-                  System.out.println("[System] General Agents ready");
+                  generalAgentRuntime.prepareStart();
+                  for (GeneralAgentRuntimeManager.GeneralLaunch general : generalConfigs) {
+                    startupPlan.add(new ModelLaunch<>(RuntimeKey.GENERAL_AGENTS,
+                        GeneralAgentRuntimeManager.class, general.displayName(),
+                        general.config().modelPath(), general, false,
+                        GeneralAgentRuntimeManager::start));
+                  }
                 } else {
                   generalAgentRuntime.stop();
                   System.out.println("[System] General role is not assigned; agents disabled");
+                }
+
+                var ttsSettings = new com.neuralsoul.config.SpeechGenerationSettingsStore(
+                    store.configs().directory()).load();
+                if (ttsSettings.common().enabled() && services != null && services.isInitialized()) {
+                  runtimeLifecycle.registry().register(RuntimeKey.COSYVOICE_TTS, services.tts());
+                  java.nio.file.Path ttsModelPath = java.nio.file.Path.of(System.getProperty("user.dir"))
+                      .resolve(ttsSettings.cosy().modelPath()).normalize();
+                  startupPlan.add(new ModelLaunch<>(RuntimeKey.COSYVOICE_TTS,
+                      com.neuralsoul.service.api.TtsService.class,
+                      "CosyVoice · " + ttsModelPath.getFileName(), ttsModelPath,
+                      ttsSettings, true, (selectedRuntime, ignored) -> selectedRuntime.start()));
+                }
+
+                ModelStartupPlan.Listener startupEvents = new ModelStartupPlan.Listener() {
+                  @Override public void planReady(java.util.List<ModelLaunch<?, ?>> launches) {
+                    Platform.runLater(() -> startupDialog.planReady(launches));
+                  }
+                  @Override public void starting(ModelLaunch<?, ?> launch, int index, int total) {
+                    startupStage[0] = "Загрузка " + launch.displayName();
+                    startupStatus("Загрузка " + launch.displayName() + "…");
+                    Platform.runLater(() -> startupDialog.modelStarting(launch, index, total));
+                  }
+                  @Override public void ready(ModelLaunch<?, ?> launch, int index, int total) {
+                    Platform.runLater(() -> startupDialog.modelReady(launch, index, total));
+                  }
+                  @Override public void failed(ModelLaunch<?, ?> launch, int index, int total, Throwable error) {
+                    if (launch.runtimeKey() == RuntimeKey.COSYVOICE_TTS)
+                      ttsStartupError = GenerationPipeline.message(error);
+                    Platform.runLater(() -> startupDialog.modelFailed(launch, index, total, error));
+                  }
+                };
+                startupPlan.execute(startupEvents, () -> checkStartupCancelled(startupCancelled));
+
+                if (webSearchConfig != null) {
+                  webSearchAgent.configure(webSearchConfig.name(), webSearchConfig.maxOutputTokens(),
+                      webReasoningRuntime.service(), webReasoningConfig.displayName());
+                  System.out.println("[System] Web Search Agent ready; reasoning="
+                      + webReasoningConfig.displayName());
                 }
 
                 startupStatus("Модели готовы · подготовка пайплайна…");
@@ -571,51 +594,16 @@ public final class AppController implements AutoCloseable {
                 pipeline.start();
                 checkStartupCancelled(startupCancelled);
 
-                // CosyVoice is a long-lived process. Start it once with the system, not on
-                // every sentence, so the GGUF and KV buffers remain resident between requests.
-                // TTS is optional: a missing executable/model should be visible in both the
-                // startup dialog and the main TTS status, but must not disable the Main LLM.
-                startupStage[0] = "Загрузка CosyVoice";
-                if (services != null && services.isInitialized()) {
+                // Model startup is owned by ModelStartupPlan. Audio output is a
+                // post-start resource, not a model runtime, so it stays here.
+                if (ttsSettings.common().enabled() && services != null && services.isInitialized()
+                    && services.tts().isRunning()) {
                   try {
-                    var ttsSettings = new com.neuralsoul.config.SpeechGenerationSettingsStore(
-                        store.configs().directory()).load();
-                    if (!ttsSettings.common().enabled()) {
-                      System.out.println("[CosyVoice] startup skipped: disabled (common.enabled=false)");
-                      Platform.runLater(startupDialog::ttsDisabled);
-                    } else {
-                      System.out.println("[System] Starting CosyVoice: model="
-                          + ttsSettings.cosy().modelPath() + ", backend="
-                          + ttsSettings.cosy().backend() + ", transport="
-                          + ttsSettings.common().transport());
-                      startupStatus("Загрузка CosyVoice…");
-                      Platform.runLater(startupDialog::ttsLoading);
-                      services.tts().start();
-                      checkStartupCancelled(startupCancelled);
-                      // Keep Java Sound open between all replies, not just between phrases.
-                      // CosyVoice3 outputs ~24 kHz mono PCM16.
-                      try {
-                        services.player().preparePcmOutput(24000, 1);
-                        System.out.println("[CosyVoice/Audio] persistent output ready (24000 Hz mono)");
-                      } catch (Exception audioError) {
-                        // A missing sound device must not prevent text generation or native TTS startup.
-                        System.err.println("[CosyVoice/Audio] pre-open failed; will retry on playback: " + audioError);
-                      }
-                      System.out.println("[CosyVoice] ready — runtime stays resident between generations");
-                      Platform.runLater(startupDialog::ttsReady);
-                    }
-                  } catch (java.util.concurrent.CancellationException e) {
-                    throw e;
-                  } catch (Exception ttsError) {
-                    ttsStartupError = GenerationPipeline.message(ttsError);
-                    System.out.println("[CosyVoice] optional startup FAILED: " + ttsStartupError);
-                    ttsError.printStackTrace(System.out);
-                    String errorText = ttsStartupError;
-                    Platform.runLater(() -> startupDialog.ttsFailed(errorText));
+                    services.player().preparePcmOutput(24000, 1);
+                    System.out.println("[CosyVoice/Audio] persistent output ready (24000 Hz mono)");
+                  } catch (Exception audioError) {
+                    System.err.println("[CosyVoice/Audio] pre-open failed; will retry on playback: " + audioError);
                   }
-                } else {
-                  System.out.println("[CosyVoice] startup skipped: TTS service is not initialized");
-                  Platform.runLater(startupDialog::ttsDisabled);
                 }
                 checkStartupCancelled(startupCancelled);
                 if (whisperRuntime.isRunning() && services != null) {
