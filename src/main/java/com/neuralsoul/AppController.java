@@ -511,8 +511,11 @@ public final class AppController implements AutoCloseable {
 
                 var ttsSettings = new com.neuralsoul.config.SpeechGenerationSettingsStore(
                     store.configs().directory()).load();
-                if (ttsSettings.common().enabled() && services != null && services.isInitialized()) {
-                  runtimeLifecycle.registry().register(RuntimeKey.COSYVOICE_TTS, services.tts());
+                if (ttsSettings.common().enabled() && services != null) {
+                  // TTS is a real runtime in the startup plan, not a lazy pipeline side effect.
+                  // Create it before plan execution and attach it to the global lifecycle.
+                  if (!services.isInitialized()) services.initialize(store.configs());
+                  runtimeLifecycle.attach(RuntimeKey.COSYVOICE_TTS, services.tts());
                   java.nio.file.Path ttsModelPath = java.nio.file.Path.of(System.getProperty("user.dir"))
                       .resolve(ttsSettings.cosy().modelPath()).normalize();
                   startupPlan.add(new ModelLaunch<>(RuntimeKey.COSYVOICE_TTS,

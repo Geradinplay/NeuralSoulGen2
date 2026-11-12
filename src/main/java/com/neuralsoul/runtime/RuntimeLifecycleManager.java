@@ -1,5 +1,7 @@
 package com.neuralsoul.runtime;
 
+import java.util.EnumMap;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -27,6 +29,8 @@ public final class RuntimeLifecycleManager implements AutoCloseable {
       .register(RuntimeKey.WEB_REASONING, webReasoningRuntime)
       .register(RuntimeKey.WEB_SEARCH, webSearchRuntime)
       .register(RuntimeKey.GENERAL_AGENTS, generalAgentRuntime);
+  /** Runtime services created outside this manager but owned by the same app lifecycle. */
+  private final Map<RuntimeKey, AutoCloseable> attached = new EnumMap<>(RuntimeKey.class);
 
   private final AtomicBoolean closed = new AtomicBoolean(false);
   private final Thread shutdownHook;
@@ -74,11 +78,26 @@ public final class RuntimeLifecycleManager implements AutoCloseable {
   }
 
   /**
+   * Attach a dynamically created runtime (for example CosyVoice from ServiceLocator).
+   * It becomes available to ModelStartupPlan and is stopped by Stop/JVM shutdown.
+   */
+  public synchronized void attach(RuntimeKey key, Object runtime) {
+    registry.register(key, runtime);
+    if (!(runtime instanceof AutoCloseable closeable))
+      throw new IllegalArgumentException("Runtime " + key + " is not AutoCloseable");
+    attached.put(key, closeable);
+  }
+
+  /**
    * Stops all external runtimes. Safe to call repeatedly.
    * Managers themselves perform graceful destroy -> destroyForcibly fallback.
    */
   public void stopAll() {
     System.out.println("[Lifecycle] Stopping all runtimes...");
+    java.util.List<Map.Entry<RuntimeKey, AutoCloseable>> dynamic;
+    synchronized (this) { dynamic = java.util.List.copyOf(attached.entrySet()); }
+    for (Map.Entry<RuntimeKey, AutoCloseable> entry : dynamic)
+      stop(entry.getKey().name(), entry.getValue());
     stop("Main LLM", modelRuntime);
     stop("Web Search", webSearchRuntime);
     stop("Web Reasoning", webReasoningRuntime);
