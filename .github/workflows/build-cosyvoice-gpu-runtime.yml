@@ -1,0 +1,156 @@
+name: Build CosyVoice GPU runtimes
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/build-cosyvoice-gpu-runtime.yml
+
+permissions:
+  contents: write
+
+env:
+  COSYVOICE_COMMIT: 81a67997e6234adde2c302e29954d0972a26f83a
+  GGML_COMMIT: 417a024b4fb6bc3116d41af7c067166a039bdf12
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: windows-2022
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # CUDA 12.4 retains Pascal support. It cannot produce Blackwell sm_120 code.
+          - name: CUDA 12.4 (Pascal-Hopper)
+            cuda: 12.4.1
+            architectures: 61;70;75;80;86;89;90
+            package: cuda-12.4
+          # CUDA 13.x covers Turing through Blackwell. Pascal/Volta belong to the 12.4 pack.
+          - name: CUDA 13.x (Turing-Blackwell)
+            cuda: 13.2.0
+            architectures: 75;80;86;89;90;100;120
+            package: cuda-13.5
+
+    steps:
+      - name: Checkout NeuralSoul
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned CosyVoice and GGML
+        shell: pwsh
+        run: |
+          git clone --no-checkout https://github.com/Lourdle/cosyvoice.cpp.git cosyvoice-src
+          git -C cosyvoice-src checkout $env:COSYVOICE_COMMIT
+          git -C cosyvoice-src submodule update --init --recursive
+          git clone --no-checkout https://github.com/ggml-org/ggml.git cosyvoice-src/vendor/ggml
+          git -C cosyvoice-src/vendor/ggml checkout $env:GGML_COMMIT
+
+      - name: Install CUDA ${{ matrix.cuda }}
+        id: cuda
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "visual_studio_integration"]'
+          log-file-suffix: ${{ matrix.package }}.txt
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S cosyvoice-src -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_CUDA_ARCHITECTURES=${{ matrix.architectures }}" `
+            "-DGGML_SOURCE_DIR=$PWD/cosyvoice-src/vendor/ggml" `
+            -DGGML_CUDA=ON `
+            -DGGML_CUDA_GRAPHS=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_RPC=ON `
+            -DCOSYVOICE_NO_FRONTEND=OFF `
+            -DCOSYVOICE_NO_ICU=OFF `
+            -DCOSYVOICE_NO_AUDIO=OFF `
+            -DCOSYVOICE_AUDIO_BACKEND=MINIAUDIO
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build matched executable and GGML
+        shell: pwsh
+        run: |
+          cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package runtime
+        shell: pwsh
+        run: |
+          $dist = "dist/${{ matrix.package }}"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          $bin = if (Test-Path "build/bin/Release") { "build/bin/Release" } else { "build/bin" }
+          $lib = if (Test-Path "build/lib/Release") { "build/lib/Release" } else { "build/lib" }
+          Copy-Item "$bin/*" $dist -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item "$lib/*" $dist -Recurse -Force -ErrorAction SilentlyContinue
+
+          # CMake downloads frontend/ICU dependencies and normally copies them beside the tools.
+          # Ensure ONNX Runtime and ICU DLLs are retained if they remained in dependency folders.
+          Get-ChildItem build -Recurse -File -Include "onnxruntime*.dll","icu*.dll" |
+            ForEach-Object { Copy-Item $_.FullName $dist -Force }
+
+          # CUDA backend dynamically links these toolkit runtimes.
+          Get-ChildItem "$env:CUDA_PATH/bin/*.dll" -File |
+            Where-Object { $_.Name -like "cudart64_*.dll" -or $_.Name -like "cublas64_*.dll" -or $_.Name -like "cublasLt64_*.dll" } |
+            ForEach-Object { Copy-Item $_.FullName $dist -Force }
+
+          Remove-Item "$dist/*.lib","$dist/*.exp","$dist/*.pdb" -Force -ErrorAction SilentlyContinue
+          @"
+          NeuralSoul CosyVoice matched GPU runtime
+          CosyVoice: $env:COSYVOICE_COMMIT
+          GGML:      $env:GGML_COMMIT
+          CUDA:      ${{ matrix.cuda }}
+          SM:        ${{ matrix.architectures }}
+          CUDA graphs are disabled because CosyVoice uses scheduler CUSTOM operations.
+          "@ | Set-Content "$dist/BUILD-INFO.txt" -Encoding UTF8
+
+          if (!(Test-Path "$dist/cosyvoice-server.exe")) { throw "cosyvoice-server.exe missing" }
+          if (!(Test-Path "$dist/cosyvoice-cli.exe")) { throw "cosyvoice-cli.exe missing" }
+          if (!(Test-Path "$dist/ggml-cuda.dll")) { throw "ggml-cuda.dll missing" }
+          & "$dist/cosyvoice-server.exe" --help | Out-File "$dist/SMOKE-TEST.txt" -Encoding UTF8
+          if ($LASTEXITCODE -ne 0) { throw "cosyvoice-server smoke test failed" }
+
+          Compress-Archive -Path "$dist/*" -DestinationPath "NeuralSoul-CosyVoice-${{ matrix.package }}.zip" -CompressionLevel Optimal
+
+      - name: Upload runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeuralSoul-CosyVoice-${{ matrix.package }}
+          path: NeuralSoul-CosyVoice-${{ matrix.package }}.zip
+          compression-level: 0
+          retention-days: 14
+
+  publish:
+    name: Publish runtime archives
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built runtimes
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cosyvoice-runtime-${{ github.run_number }}
+          name: NeuralSoul CosyVoice GPU Runtime ${{ github.run_number }}
+          prerelease: true
+          generate_release_notes: false
+          body: |
+            Matched CosyVoice + GGML builds for NeuralSoul.
+
+            - CUDA 12.4: sm_61, sm_70, sm_75, sm_80, sm_86, sm_89, sm_90
+            - CUDA 13.x: sm_75, sm_80, sm_86, sm_89, sm_90, sm_100, sm_120
+            - CUDA graphs disabled for CosyVoice CUSTOM scheduler operations
+          files: artifacts/*.zip

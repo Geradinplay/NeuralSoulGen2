@@ -46,6 +46,7 @@ public final class CosyVoiceTtsService implements TtsService {
   private volatile InputStream activeStream;
   private volatile String fingerprint = "";
   private volatile Settings activeSettings;
+  private volatile String activePack = "";
 
   public CosyVoiceTtsService(SpeechGenerationSettingsStore store, Supplier<List<AllowedDevice>> hardware) {
     this.store = Objects.requireNonNull(store);
@@ -86,8 +87,7 @@ public final class CosyVoiceTtsService implements TtsService {
       String backend = placement.backend();
       Path model = resolveFile(f.modelPath());
       Path voicePrompt = resolveFile(f.voicePromptPath());
-      // CUDA packs: the user's choice goes first; if it dies at startup the other
-      // CUDA pack is tried silently before reporting a failure.
+      // The exact runtime selected in the GUI is authoritative. Never silently replace it.
       List<String> packFolders = resolvePackFolders(backend, f.cudaPack());
       Throwable lastFailure = null;
       for (int attempt = 0; attempt < packFolders.size(); attempt++) {
@@ -108,8 +108,8 @@ public final class CosyVoiceTtsService implements TtsService {
         } catch (ProcessDiedException e) {
           lastFailure = e.getCause() != null ? e.getCause() : e;
           System.out.println("[CosyVoice] pack " + pack + " failed: " + lastFailure.getMessage()
-              + (attempt + 1 < packFolders.size() ? "; trying next CUDA pack" : ""));
-          TtsTrace.log("SERVICE_PACK_RETRY", "pack=" + pack + " error=" + lastFailure.getMessage());
+              + (attempt + 1 < packFolders.size() ? "; trying next pack" : ""));
+          TtsTrace.log("SERVICE_PACK_FAILED", "pack=" + pack + " error=" + lastFailure.getMessage());
           stopInternal();
         }
       }
@@ -128,7 +128,7 @@ public final class CosyVoiceTtsService implements TtsService {
     List<String> cmd = new ArrayList<>(List.of(exe.toString(), "-m", model.toString(),
         "--api", "--stream", "--served-model-name", SpeechGenerationSettingsStore.SERVED_MODEL_NAME,
         "--voice-prompt", f.voice() + "=" + voicePrompt.toString(),
-        "-H", f.host(), "-P", Integer.toString(f.httpPort())));
+        "--host", f.host(), "--port", Integer.toString(f.httpPort())));
     int index = placement.nativeIndex();
     if ("CPU".equals(backend)) {
       cmd.add("--cpu");
@@ -160,6 +160,7 @@ public final class CosyVoiceTtsService implements TtsService {
     pb.redirectErrorStream(true);
     pb.redirectOutput(ProcessBuilder.Redirect.appendTo(log.toFile()));
     ownedProcess = pb.start();
+    activePack = pack;
     System.out.println("[CosyVoice] starting pack=" + pack + " backend=" + backend
         + " device=" + index
         + " selectedGPU=" + (placement.device() == null ? "CPU" : placement.device().name())
@@ -183,13 +184,27 @@ public final class CosyVoiceTtsService implements TtsService {
         stopInternal();
         // A quick death usually means the CUDA runtime does not match the driver.
         if (System.nanoTime() - startedNanos < graceNanos) {
-          System.out.println("[CosyVoice/GPU] native log: " + tail(log));
+          System.out.println("[CosyVoice/GPU] native log: " + logExcerpt(log, nativeLogOffset));
           throw new ProcessDiedException(
               new IOException("CosyVoice завершился при запуске; смотри logs/tts-cosyvoice.log"));
         }
         throw new IOException("CosyVoice завершился при запуске; смотри logs/tts-cosyvoice.log");
       }
       if (tcpReady(f.host(), f.httpPort())) {
+        // Opening a port only proves that DLLs and the model loaded. CUDA/PTX incompatibilities
+        // often appear on the first kernel, so validate one tiny inference while the startup
+        // dialog still knows which runtime is being launched.
+        if ("CUDA".equals(backend) || "VULKAN".equals(backend)) {
+          try {
+            verifyGpuInference(f, backend, pack);
+          } catch (Exception probeError) {
+            IOException compatibility = "CUDA".equals(backend)
+                ? cudaCompatibilityFailure(pack, placement.device(),
+                    logExcerpt(log, nativeLogOffset), probeError)
+                : vulkanCompatibilityFailure(placement.device(), probeError);
+            throw new ProcessDiedException(compatibility);
+          }
+        }
         // A listening TCP socket does NOT establish GPU offload or actual model residency.
         // Show the backend's own layer allocation report instead of claiming VRAM was used.
         printNativeOffloadDiagnostics(log, nativeLogOffset, backend);
@@ -204,22 +219,173 @@ public final class CosyVoiceTtsService implements TtsService {
     throw new IOException("CosyVoice не открыл порт за 120 секунд; смотри logs/tts-cosyvoice.log");
   }
 
-  /** The chosen CUDA pack first, then the other one as a silent fallback; other backends have exactly one folder. */
+  /** Resolve exactly the runtime selected by the user; compatibility failures are shown in the GUI. */
   private static List<String> resolvePackFolders(String backend, String cudaPack) {
     if ("CUDA".equals(backend)) {
-      if ("cuda-12.4".equals(cudaPack)) return List.of("cuda-12.4", "cuda-13.5");
-      return List.of("cuda-13.5", "cuda-12.4");
+      return List.of("cuda-12.4".equals(cudaPack) ? "cuda-12.4" : "cuda-13.5");
     }
     if ("VULKAN".equals(backend)) return List.of("vulkan");
     if ("CPU".equals(backend)) return List.of("cpu");
     throw new IllegalArgumentException("Unknown backend: " + backend);
   }
 
-  private static String tail(Path log) {
+  /** Executes one real GPU inference and validates its waveform before enabling playback. */
+  private void verifyGpuInference(Cosy f, String backend, String pack) throws Exception {
+    Map<String, Object> body = new LinkedHashMap<>();
+    body.put("model", SpeechGenerationSettingsStore.SERVED_MODEL_NAME);
+    body.put("input", "Проверка.");
+    body.put("voice", f.voice());
+    body.put("response_format", "wav");
+    body.put("stream", false);
+    body.put("speed", 1.0);
+    body.put("seed", 12345);
+    URI uri = URI.create("http://" + f.host() + ":" + f.httpPort() + "/v1/audio/speech");
+    HttpRequest request = HttpRequest.newBuilder(uri).timeout(Duration.ofMinutes(3))
+        .header("Content-Type", "application/json")
+        .header("Accept", "audio/wav")
+        .POST(HttpRequest.BodyPublishers.ofString(Json.write(body), StandardCharsets.UTF_8))
+        .build();
+    TtsTrace.log("SERVICE_GPU_PROBE", "backend=" + backend + " pack=" + pack + " endpoint=" + uri);
     try {
-      byte[] bytes = Files.readAllBytes(log);
-      int from = (int) Math.max(0, bytes.length - 8192);
-      return new String(bytes, from, bytes.length - from, StandardCharsets.UTF_8).strip();
+      HttpResponse<byte[]> response = http.send(request, HttpResponse.BodyHandlers.ofByteArray());
+      byte[] wav = response.body();
+      if (response.statusCode() != 200) {
+        throw new IOException("проверочный запрос вернул HTTP " + response.statusCode() + ": "
+            + new String(wav, 0, Math.min(wav.length, 1024), StandardCharsets.UTF_8));
+      }
+      if (wav.length < 44 || !"RIFF".equals(new String(wav, 0, 4, StandardCharsets.US_ASCII))) {
+        throw new IOException("проверочный запрос не вернул WAV (" + wav.length + " байт)");
+      }
+      WavQuality quality = inspectWavQuality(wav);
+      TtsTrace.log("SERVICE_GPU_PROBE_AUDIO", "backend=" + backend + " pack=" + pack
+          + " format=" + quality.formatCode() + " bits=" + quality.bits()
+          + " sampleRate=" + quality.sampleRate() + " rms=" + formatMetric(quality.rms())
+          + " zeroCrossing=" + formatMetric(quality.zeroCrossing())
+          + " peak=" + formatMetric(quality.peak()));
+      if (!Double.isFinite(quality.rms()) || !Double.isFinite(quality.zeroCrossing())
+          || (quality.rms() < 0.008 && quality.zeroCrossing() > 0.40)) {
+        throw new IOException("проверочный WAV содержит высокочастотный шум вместо речи "
+            + "(RMS=" + formatMetric(quality.rms())
+            + ", zero-crossing=" + formatMetric(quality.zeroCrossing()) + ")");
+      }
+      TtsTrace.log("SERVICE_GPU_PROBE_READY", "backend=" + backend + " pack=" + pack
+          + " wavBytes=" + wav.length);
+    } catch (Exception failure) {
+      Process process = ownedProcess;
+      if (process != null && process.isAlive()) {
+        try { process.waitFor(1200, java.util.concurrent.TimeUnit.MILLISECONDS); }
+        catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          throw interrupted;
+        }
+      }
+      throw failure;
+    }
+  }
+
+  private record WavQuality(int formatCode, int bits, int sampleRate,
+                            double rms, double zeroCrossing, double peak) {}
+
+  private static WavQuality inspectWavQuality(byte[] wav) throws IOException {
+    ByteBuffer b = ByteBuffer.wrap(wav).order(ByteOrder.LITTLE_ENDIAN);
+    if (wav.length < 44) throw new IOException("слишком короткий WAV");
+    int formatCode = -1, bits = -1, sampleRate = -1, dataOffset = -1, dataLength = -1;
+    int at = 12;
+    while (at + 8 <= wav.length) {
+      String id = new String(wav, at, 4, StandardCharsets.US_ASCII);
+      long sizeLong = b.getInt(at + 4) & 0xffffffffL;
+      if (sizeLong > Integer.MAX_VALUE) sizeLong = wav.length - at - 8L;
+      int size = (int) Math.min(sizeLong, wav.length - at - 8L);
+      if ("fmt ".equals(id) && size >= 16) {
+        formatCode = b.getShort(at + 8) & 0xffff;
+        sampleRate = b.getInt(at + 12);
+        bits = b.getShort(at + 22) & 0xffff;
+      } else if ("data".equals(id)) {
+        dataOffset = at + 8;
+        dataLength = size;
+        break;
+      }
+      at += 8 + size + (size & 1);
+    }
+    if (dataOffset < 0 || sampleRate <= 0)
+      throw new IOException("в проверочном WAV отсутствует fmt/data");
+    int bytesPerSample = bits / 8;
+    if (!((formatCode == 1 && bits == 16) || (formatCode == 3 && bits == 32)))
+      throw new IOException("неподдерживаемый проверочный WAV: format=" + formatCode + " bits=" + bits);
+    int samples = dataLength / bytesPerSample;
+    if (samples < 1000) throw new IOException("в проверочном WAV слишком мало аудиоданных");
+    double sumSquares = 0, peak = 0;
+    int crossings = 0;
+    double previous = 0;
+    for (int i = 0; i < samples; i++) {
+      double value = formatCode == 1
+          ? b.getShort(dataOffset + i * 2) / 32768.0
+          : b.getFloat(dataOffset + i * 4);
+      if (!Double.isFinite(value)) throw new IOException("проверочный WAV содержит NaN/Infinity");
+      sumSquares += value * value;
+      peak = Math.max(peak, Math.abs(value));
+      if (i > 0 && (value < 0) != (previous < 0)) crossings++;
+      previous = value;
+    }
+    return new WavQuality(formatCode, bits, sampleRate,
+        Math.sqrt(sumSquares / samples), (double) crossings / (samples - 1), peak);
+  }
+
+  private static String formatMetric(double value) {
+    return String.format(Locale.ROOT, "%.4f", value);
+  }
+
+  private static IOException cudaCompatibilityFailure(
+      String pack, AllowedDevice device, String nativeOutput, Exception probeError) {
+    String lower = nativeOutput == null ? "" : nativeOutput.toLowerCase(Locale.ROOT);
+    String reason;
+    if (lower.contains("provided ptx was compiled with an unsupported toolchain")) {
+      reason = "the provided PTX was compiled with an unsupported toolchain";
+    } else if (lower.contains("op not supported") && lower.contains("custom")) {
+      reason = "GGML CUDA не поддерживает требуемую операцию CUSTOM";
+    } else if (lower.contains("cuda error:")) {
+      reason = nativeOutput.lines()
+          .map(String::strip)
+          .filter(line -> line.toLowerCase(Locale.ROOT).contains("cuda error:"))
+          .findFirst().orElse("неизвестная ошибка CUDA");
+    } else {
+      reason = probeError.getMessage() == null ? probeError.toString() : probeError.getMessage();
+    }
+    String version = pack.startsWith("cuda-") ? pack.substring("cuda-".length()) : pack;
+    String gpu = device == null ? "выбранной GPU" : device.name();
+    String recommendation = lower.contains("provided ptx was compiled with an unsupported toolchain")
+        ? "CUDA 13.5 несовместима с этой GPU/драйвером."
+        : lower.contains("op not supported") && lower.contains("custom")
+            ? "Готовая GGML CUDA-сборка не поддерживает операцию CosyVoice CUSTOM."
+            : "Выбранный CUDA runtime завершился во время проверочного синтеза.";
+    return new IOException("Версия CUDA " + version + " не подходит для CosyVoice на " + gpu + ".\n"
+        + "Причина: " + reason + ".\n"
+        + recommendation + " Если обе встроенные версии CUDA уже проверены и завершились ошибкой, "
+        + "необходимо установить согласованную сборку CosyVoice + GGML под эту GPU "
+        + "или отключить TTS; повторное переключение версий не поможет.", probeError);
+  }
+
+  private static IOException vulkanCompatibilityFailure(AllowedDevice device, Exception probeError) {
+    String gpu = device == null ? "выбранной GPU" : device.name();
+    String reason = probeError.getMessage() == null ? probeError.toString() : probeError.getMessage();
+    return new IOException("Vulkan runtime CosyVoice не подходит для " + gpu + ".\n"
+        + "Причина: " + reason + ".\n"
+        + "Backend остановлен до воспроизведения повреждённого звука. "
+        + "Попробуйте в настройках выбрать совместимую CUDA-версию.", probeError);
+  }
+
+  /** Read only this process launch, never stale errors appended by an older CUDA pack. */
+  private static String logExcerpt(Path log, long startOffset) {
+    try (java.nio.channels.FileChannel file = java.nio.channels.FileChannel.open(log, StandardOpenOption.READ)) {
+      long end = file.size();
+      long from = Math.max(0L, Math.min(startOffset, end));
+      // Keep diagnostics bounded while preserving the newest part of this launch.
+      if (end - from > 262144L) from = end - 262144L;
+      byte[] bytes = new byte[(int) (end - from)];
+      ByteBuffer buffer = ByteBuffer.wrap(bytes);
+      file.position(from);
+      while (buffer.hasRemaining() && file.read(buffer) != -1) { /* read launch excerpt */ }
+      return new String(bytes, 0, buffer.position(), StandardCharsets.UTF_8).strip();
     } catch (IOException e) {
       return "(unable to read log: " + e.getMessage() + ")";
     }
@@ -359,6 +525,7 @@ public final class CosyVoiceTtsService implements TtsService {
     cancelSpeech();
     Process process = ownedProcess;
     ownedProcess = null;
+    activePack = "";
     activeSettings = null;
     fingerprint = "";
     if (process != null) {
@@ -378,7 +545,7 @@ public final class CosyVoiceTtsService implements TtsService {
     Settings s = requireReady();
     long started = System.nanoTime();
     TtsTrace.log("TTS_SPEAK", "chars=" + (text == null ? 0 : text.length())
-        + " running=" + isRunning() + " backend=" + s.cosy().backend());
+        + " running=" + isRunning() + " backend=" + s.cosy().backend() + " pack=" + activePack);
     try (Response stream = request(text, s, true)) {
       PcmFormat format = readWavHeader(stream.body());
       TtsTrace.log("TTS_AUDIO_FORMAT", "sampleRate=" + format.sampleRate()

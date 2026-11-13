@@ -22,6 +22,8 @@ public final class StartupDialog {
   private final Runnable retryAction;
   private final Runnable stopAction;
   private boolean failed;
+  private ModelLaunch<?, ?> optionalFailedLaunch;
+  private Throwable optionalFailure;
 
   public StartupDialog(Stage owner) { this(owner, null, null); }
   public StartupDialog(Stage owner, Runnable retryAction) { this(owner, retryAction, null); }
@@ -30,7 +32,10 @@ public final class StartupDialog {
     this.stopAction = stopAction;
     dialog.initOwner(owner); dialog.initModality(Modality.WINDOW_MODAL); dialog.setResizable(false);
     progress.setMaxWidth(Double.MAX_VALUE); progress.setPrefHeight(9); UiStyles.accentProgress(progress);
-    log.setEditable(false); log.setWrapText(false); log.setPrefRowCount(6);
+    log.setEditable(false); log.setWrapText(false); log.setPrefRowCount(12);
+    log.setMinHeight(180);
+    log.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
+    VBox.setVgrow(log, Priority.ALWAYS);
     UiStyles.startupLog(log);
     log.setText("[system] waiting for runtime...\n");
 
@@ -46,10 +51,15 @@ public final class StartupDialog {
       append("[system] emergency startup stop requested");
       if (stopAction != null) stopAction.run();
     });
-    HBox stopRow = new HBox(new Region(), emergencyStop); HBox.setHgrow(stopRow.getChildren().get(0), Priority.ALWAYS);
+    HBox stopRow = new HBox(new Region(), emergencyStop);
+    stopRow.setAlignment(Pos.CENTER_RIGHT);
+    HBox.setHgrow(stopRow.getChildren().get(0), Priority.ALWAYS);
     // The runtime list is dynamic and belongs in the log. No fixed Qdrant/Main/TTS
     // rows: the startup plan is the single source of truth for what actually starts.
     VBox body = new VBox(12, title, top, progress, log, stopRow);
+    body.setFillWidth(true);
+    body.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
+    VBox.setVgrow(body, Priority.ALWAYS);
     root.getChildren().addAll(header, body);
     root.setPadding(new Insets(20, 24, 22, 24));
     UiStyles.startupPanel(root, false); root.setEffect(new DropShadow(28, Color.rgb(35,20,70,.35)));
@@ -87,8 +97,60 @@ public final class StartupDialog {
     append("[" + launch.runtimeKey().name().toLowerCase() + "] "
         + (launch.optional() ? "optional failure" : "FAILED") + " · "
         + (error.getMessage() == null ? error.toString() : error.getMessage()));
+    if (launch.optional()) {
+      optionalFailedLaunch = launch;
+      optionalFailure = error;
+    }
   }
-  public void successAndClose() { set(1,"Система готова"); append("[system] all components are ready"); dialog.close(); }
+  public void successAndClose() {
+    if (optionalFailedLaunch != null) {
+      showRuntimeFailure(optionalFailedLaunch, optionalFailure);
+      return;
+    }
+    set(1,"Система готова"); append("[system] all components are ready"); dialog.close();
+  }
+
+  /** Keep the startup window visible when an optional model/runtime failed. */
+  private void showRuntimeFailure(ModelLaunch<?, ?> launch, Throwable error) {
+    failed = true;
+    UiStyles.startupPanel(root, true);
+    root.getChildren().clear();
+    String msg = error == null ? "Неизвестная ошибка"
+        : (error.getMessage() == null ? error.toString() : error.getMessage());
+    String path = launch.modelPath() == null ? ""
+        : "Модель: " + launch.modelPath().getFileName();
+
+    Label brand = label("✦  NeuralSoul", 16, "#d9cbd0");
+    Label runtimeName = label(launch.displayName(), 24, "#fff3f3");
+    runtimeName.setWrapText(true);
+    Label runtimeKey = label("Рантайм: " + launch.runtimeKey(), 14, "#e0c8ce");
+    Label modelName = label(path, 13, "#bdaeb8");
+    Label errTitle = label("⚠  Рантайм не запущен", 18, "#ffcccc");
+    Label continuation = label("Остальные компоненты системы запущены.", 13, "#c9bdca");
+    TextArea details = new TextArea(msg);
+    details.setEditable(false);
+    details.setWrapText(true);
+    details.setPrefRowCount(7);
+    UiStyles.errorDetails(details);
+
+    Button logs = new Button("▣  Показать полностью");
+    Button close = new Button("Закрыть");
+    logs.setOnAction(e -> {
+      details.setPrefRowCount(details.getPrefRowCount() == 7 ? 12 : 7);
+      dialog.sizeToScene();
+    });
+    close.setOnAction(e -> dialog.close());
+    UiStyles.secondaryDialogButton(logs, "#3b2932");
+    UiStyles.secondaryDialogButton(close, "#55495e");
+    HBox buttons = new HBox(12, logs, new Region(), close);
+    HBox.setHgrow(buttons.getChildren().get(1), Priority.ALWAYS);
+
+    root.getChildren().addAll(brand, runtimeName, runtimeKey);
+    if (!path.isBlank()) root.getChildren().add(modelName);
+    root.getChildren().addAll(errTitle, details, continuation, buttons);
+    root.setPadding(new Insets(20, 26, 24, 26));
+    dialog.sizeToScene();
+  }
   public void fail(String stage, Throwable t) {
     failed=true; UiStyles.startupPanel(root, true); root.getChildren().clear();
     String msg=t==null?"Неизвестная ошибка":(t.getMessage()==null?t.toString():t.getMessage());

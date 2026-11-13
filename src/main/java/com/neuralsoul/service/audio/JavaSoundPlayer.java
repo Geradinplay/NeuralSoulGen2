@@ -316,7 +316,6 @@ public final class JavaSoundPlayer implements AudioPlayer {
     private void writeLoop() {
       try {
         boolean speechStarted = false;
-        long lastBlockNs = System.nanoTime();
         while (running && !closed && !Thread.currentThread().isInterrupted()) {
           if (!speechStarted && pendingBytes.get() < startupBytes && !finishing) {
             fillIdleSilence();
@@ -324,14 +323,29 @@ public final class JavaSoundPlayer implements AudioPlayer {
           }
           Packet packet = packets.poll(12, TimeUnit.MILLISECONDS);
           if (packet == null) {
-            if (speechStarted && !finishing
-                && System.nanoTime() - lastBlockNs > TimeUnit.MILLISECONDS.toNanos(70)) {
-              underruns++;
-              speechStarted = false;
-              TtsTrace.log("PLAYER_UNDERRUN", "count=" + underruns
-                  + " nextPCMPrebuffer=true deviceRemainsOpen=true");
+            if (speechStarted && !finishing) {
+              // A pause between HTTP packets is not an audio underrun: output.write() may have
+              // already placed hundreds of milliseconds in the native device. Rebuffer only when
+              // both Java's queue and the SourceDataLine are actually almost empty.
+              int deviceQueuedBytes = Math.max(0, output.getBufferSize() - output.available());
+              int deviceFloorBytes = alignedBytes((int) format.getSampleRate(),
+                  format.getFrameSize(), SILENCE_BLOCK_MS);
+              if (pendingBytes.get() == 0 && packets.isEmpty()
+                  && deviceQueuedBytes <= deviceFloorBytes) {
+                underruns++;
+                speechStarted = false;
+                TtsTrace.log("PLAYER_UNDERRUN", "count=" + underruns
+                    + " deviceQueuedBytes=" + deviceQueuedBytes
+                    + " pendingBytes=0 nextPCMPrebuffer=true deviceRemainsOpen=true");
+                fillIdleSilence();
+              } else {
+                // Do not inject silence behind still-buffered speech. It would create artificial
+                // gaps and was the source of repeated chirping/rebuffer cycles on slow Vulkan TTS.
+                Thread.sleep(4);
+              }
+            } else {
+              fillIdleSilence();
             }
-            fillIdleSilence();
             continue;
           }
           if (packet.epoch != generation) {
@@ -361,7 +375,6 @@ public final class JavaSoundPlayer implements AudioPlayer {
             TtsTrace.log("PLAYER_BUFFER_READY", "epoch=" + generation
                 + " pendingBytes=" + pendingBytes.get() + " sourceLineReused=true");
           }
-          lastBlockNs = System.nanoTime();
           int offset = 0;
           while (offset < packet.audio.length && running && !closed && generation == packet.epoch) {
             int writable = Math.min(AUDIO_WRITE_BLOCK, packet.audio.length - offset);
