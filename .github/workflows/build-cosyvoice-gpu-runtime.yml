@@ -27,14 +27,14 @@ jobs:
             cuda: 12.4.1
             architectures: 61;70;75;80;86;89;90
             package: cuda-12.4
-            cuda_subpackages: '["nvcc", "cudart", "cublas", "visual_studio_integration"]'
+            cuda_subpackages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
           # CUDA 13.x covers Turing through Blackwell. Pascal/Volta belong to the 12.4 pack.
           - name: CUDA 13.x (Turing-Blackwell)
             cuda: 13.2.0
             architectures: 75;80;86;89;90;100;120
             package: cuda-13.5
             # CUDA 13 split compiler CRT headers and NVVM out of the nvcc package.
-            cuda_subpackages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "visual_studio_integration"]'
+            cuda_subpackages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
 
     steps:
       - name: Checkout NeuralSoul
