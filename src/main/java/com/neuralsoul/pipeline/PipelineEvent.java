@@ -9,6 +9,8 @@ public record PipelineEvent(long generation, Type type, String text) {
     CHUNK,
     WARNING,
     THINK_START,
-    THINK_END
+    THINK_END,
+    /** Development mode: a plan proposal that waits for user approval in the chat UI. */
+    PLAN
   }
 }

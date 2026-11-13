@@ -1,8 +1,13 @@
 package com.neuralsoul.ui.pages;
 
+import com.neuralsoul.files.FilePermissionRequest;
 import com.neuralsoul.model.*;
+import com.neuralsoul.pipeline.GenerationPipeline;
 import com.neuralsoul.ui.components.*;
 import com.neuralsoul.ui.styles.UiStyles;
+import java.util.Locale;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javafx.collections.ListChangeListener;
@@ -24,6 +29,11 @@ public final class ChatPage extends BorderPane {
 
   private final VBox conversation = new VBox(10);
   private final ScrollPane scroll;
+  private final VBox planPanel = new VBox(8);
+  private final TextArea planArea = new TextArea();
+  private final TextField planFeedback = new TextField();
+  /** File-tool approval card currently waiting in the chat. FX-thread only. */
+  private Node pendingPermissionCard;
 
   public ChatPage(AppState state) {
     VBox header = Ui.page("Чат с Ниной", "Локальный AI-компаньон · " + state.mode.get());
@@ -31,6 +41,7 @@ public final class ChatPage extends BorderPane {
     conversation.setPadding(new Insets(12, 24, 8, 24));
     scroll = Ui.scroll(conversation);
     setCenter(scroll);
+    buildPlanPanel(state);
     Runnable render =
         () -> {
           conversation.getChildren().clear();
@@ -71,6 +82,8 @@ public final class ChatPage extends BorderPane {
               conversation.getChildren().add(bubble);
             }
           }
+          // The approval card lives at the end of the feed; streaming re-renders must keep it.
+          if (pendingPermissionCard != null) conversation.getChildren().add(pendingPermissionCard);
         };
     state.messages.addListener(
         (ListChangeListener<ChatMessage>) c -> {
@@ -107,6 +120,203 @@ public final class ChatPage extends BorderPane {
       scroll.layout();
       scroll.setVvalue(1.0);
     });
+  }
+
+  /**
+   * Development mode: bottom area = plan approval panel (visible only while a plan is
+   * pending) + the regular composer. The composer keeps its own padding.
+   */
+  public void attachComposer(Node composer) {
+    planPanel.setVisible(false);
+    planPanel.setManaged(false);
+    VBox bottom = new VBox(8, planPanel, composer);
+    bottom.setFillWidth(true);
+    setBottom(bottom);
+  }
+
+  private void buildPlanPanel(AppState state) {
+    Label title = Ui.label("План разработки", "muted");
+    UiStyles.heading(title, false);
+    planArea.setEditable(true);
+    planArea.setWrapText(true);
+    planArea.getStyleClass().add("body");
+    planArea.setMaxWidth(Double.MAX_VALUE);
+    planArea.setPrefRowCount(6);
+    UiStyles.chatText(planArea, false);
+    Label feedbackLabel = Ui.label("Что доработать:", "muted");
+    planFeedback.setPromptText("Опишите, что изменить в плане (для кнопки «Доработать»)");
+    planFeedback.setMaxWidth(Double.MAX_VALUE);
+    HBox.setHgrow(planFeedback, Priority.ALWAYS);
+
+    Button approve = new Button("Одобрить");
+    Button revise = new Button("Доработать");
+    Button reject = new Button("Отказаться");
+    approve.setOnAction(e -> sendDecision(state, GenerationPipeline.PlanDecision.approve(planArea.getText())));
+    revise.setOnAction(e -> {
+      String feedback = planFeedback.getText().trim();
+      if (feedback.isEmpty()) {
+        planFeedback.setPromptText("Сначала опишите, что доработать в плане");
+        return;
+      }
+      sendDecision(state, GenerationPipeline.PlanDecision.revise(feedback));
+      planFeedback.clear();
+    });
+    reject.setOnAction(e -> sendDecision(state, GenerationPipeline.PlanDecision.reject()));
+    HBox actions = new HBox(8, feedbackLabel, planFeedback, approve, revise, reject);
+    actions.setAlignment(Pos.CENTER_LEFT);
+    actions.setMaxWidth(Double.MAX_VALUE);
+
+    planPanel.getChildren().addAll(title, planArea, actions);
+    planPanel.setPadding(new Insets(10, 12, 0, 12));
+    planPanel.setFillWidth(true);
+    // The panel exists only while the pipeline waits for a plan decision.
+    state.pendingPlan.addListener(
+        (o, old, plan) ->
+            javafx.application.Platform.runLater(() -> {
+              boolean present = plan != null && !plan.isBlank();
+              if (present) planArea.setText(plan);
+              planPanel.setVisible(present);
+              planPanel.setManaged(present);
+              if (present) javafx.application.Platform.runLater(() -> scroll.setVvalue(1));
+            }));
+  }
+
+  private void sendDecision(AppState state, GenerationPipeline.PlanDecision decision) {
+    Consumer<GenerationPipeline.PlanDecision> handler = state.planDecisionHandler;
+    if (handler == null) {
+      System.out.println("[Plan] decision dropped: no handler wired");
+      return;
+    }
+    // Hide immediately; the pipeline will show a new plan on the next PLAN event.
+    state.pendingPlan.set(null);
+    handler.accept(decision);
+  }
+
+  /**
+   * File-tool approval as an inline chat block (not a modal dialog). The calling pipeline
+   * thread blocks until the user presses "Подтвердить" or "Отклонить" in the chat.
+   */
+  public boolean awaitFilePermission(FilePermissionRequest request) {
+    CompletableFuture<Boolean> decision = new CompletableFuture<>();
+    Runnable show = () -> {
+      try {
+        Node card = permissionCard(request, decision);
+        pendingPermissionCard = card;
+        conversation.getChildren().add(card);
+        scrollToBottom();
+      } catch (Throwable e) {
+        pendingPermissionCard = null;
+        decision.complete(false);
+      }
+    };
+    if (javafx.application.Platform.isFxApplicationThread()) show.run();
+    else javafx.application.Platform.runLater(show);
+    try {
+      return decision.get();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return false;
+    } catch (java.util.concurrent.ExecutionException e) {
+      return false;
+    }
+  }
+
+  /** Inline approval card; after the decision it stays in the chat as a record. */
+  private Node permissionCard(FilePermissionRequest request, CompletableFuture<Boolean> decision) {
+    String action = switch (request.operation()) {
+      case "read" -> "Прочитать файл";
+      case "write" -> "Записать файл";
+      case "edit" -> "Изменить файл";
+      case "patch" -> "Применить изменение";
+      case "grep" -> "Поиск внутри файлов";
+      case "delete" -> "Удалить файл или папку";
+      default -> request.operation();
+    };
+    Label title = Ui.label("Запрос доступа · " + action, "muted");
+    UiStyles.heading(title, false);
+    Label pathLabel = Ui.label(request.path(), "muted");
+    pathLabel.setWrapText(true);
+    pathLabel.setStyle("-fx-font-family:'Consolas';-fx-font-size:12px;");
+    Node details = permissionDetails(request);
+
+    Button approve = new Button("Подтвердить");
+    Button deny = new Button("Отклонить");
+    approve.setOnAction(e -> {
+      if (decision.isDone()) return;
+      approve.setDisable(true);
+      deny.setDisable(true);
+      title.setText("Подтверждено · " + action);
+      pendingPermissionCard = null;
+      decision.complete(true);
+    });
+    deny.setOnAction(e -> {
+      if (decision.isDone()) return;
+      approve.setDisable(true);
+      deny.setDisable(true);
+      title.setText("Отклонено · " + action);
+      pendingPermissionCard = null;
+      decision.complete(false);
+    });
+    HBox actions = new HBox(8, approve, deny);
+    actions.setAlignment(Pos.CENTER_LEFT);
+
+    VBox card = new VBox(8, title, pathLabel, details, actions);
+    card.setFillWidth(true);
+    card.setPadding(new Insets(10, 12, 10, 12));
+    card.getStyleClass().add("assistant-bubble");
+    return card;
+  }
+
+  /**
+   * Permission details rendered with code highlighting. Sections of the details text
+   * ("--- CURRENT ---", "--- PROPOSED ---", "--- OLD ---", "--- NEW ---") become labelled
+   * code blocks; anything without sections stays a plain selectable text.
+   */
+  private static Node permissionDetails(FilePermissionRequest request) {
+    String details = request.details() == null ? "" : request.details();
+    String lang = languageForPath(request.path());
+    Pattern section = Pattern.compile("(?m)^---\\s*(.+?)\\s*---\\s*$");
+    Matcher first = section.matcher(details);
+    if (!first.find()) return selectableText(details, false);
+
+    VBox box = new VBox(6);
+    box.setFillWidth(true);
+    Matcher matcher = section.matcher(details);
+    int from = 0;
+    while (matcher.find()) {
+      if (matcher.start() > from) {
+        String head = details.substring(from, matcher.start()).strip();
+        if (!head.isBlank()) box.getChildren().add(selectableText(head, false));
+      }
+      Label tag = Ui.label(matcher.group(1), "muted");
+      int bodyStart = matcher.end();
+      int bodyEnd = details.length();
+      Matcher next = section.matcher(details);
+      if (next.find(bodyStart)) bodyEnd = next.start();
+      String body = details.substring(bodyStart, bodyEnd).strip();
+      box.getChildren().add(tag);
+      box.getChildren().add(codeBlock(lang, body.isEmpty() ? "(пусто)" : body));
+      from = bodyEnd;
+    }
+    if (from < details.length()) {
+      String tail = details.substring(from).strip();
+      if (!tail.isBlank()) box.getChildren().add(selectableText(tail, false));
+    }
+    return box;
+  }
+
+  /** Picks a syntax-highlighting language from the target file extension. */
+  private static String languageForPath(String path) {
+    String p = path == null ? "" : path.toLowerCase(Locale.ROOT);
+    if (p.endsWith(".html") || p.endsWith(".htm")) return "html";
+    if (p.endsWith(".css")) return "css";
+    if (p.endsWith(".js")) return "javascript";
+    if (p.endsWith(".ts")) return "typescript";
+    if (p.endsWith(".py")) return "python";
+    if (p.endsWith(".java")) return "java";
+    if (p.endsWith(".json")) return "json";
+    if (p.endsWith(".xml") || p.endsWith(".yml") || p.endsWith(".yaml")) return "xml";
+    return "code";
   }
 
   /**

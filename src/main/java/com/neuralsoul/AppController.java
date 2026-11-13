@@ -171,8 +171,12 @@ public final class AppController implements AutoCloseable {
             this::microphone,
             this::clearContext);
     // The input belongs to ChatPage itself, never to the shared application footer.
-    chat.setBottom(composer);
-    BorderPane.setMargin(composer, new Insets(0, 16, 4, 4));
+    // attachComposer wraps it together with the development-mode plan approval panel.
+    chat.attachComposer(composer);
+    state.planDecisionHandler =
+        decision -> {
+          if (pipeline != null) pipeline.resolvePlan(pipeline.generationId(), decision);
+        };
     state.alwaysListen.addListener((obs, oldValue, enabled) -> {
       store.save(state);
       if (enabled) startContinuousListening(); else stopContinuousListening();
@@ -279,6 +283,20 @@ public final class AppController implements AutoCloseable {
                         pause.play();
                       }
                       case TRANSCRIPT -> state.messages.add(new ChatMessage("Вы", event.text()));
+                      case PLAN -> {
+                        // The empty streaming bubble becomes the plan itself; the final
+                        // summary arrives later as a separate message (streamingMessageIndex
+                        // is released so RESPONSE adds a new bubble instead of overwriting).
+                        String planText = "📋 План разработки\n\n" + event.text();
+                        if (streamingMessageIndex >= 0 && streamingMessageIndex < state.messages.size()) {
+                          state.messages.set(streamingMessageIndex, new ChatMessage("Nina", planText));
+                          streamingMessageIndex = -1;
+                        } else {
+                          state.messages.add(new ChatMessage("Nina", planText));
+                        }
+                        state.pendingPlan.set(event.text());
+                        state.status.set("План готов · ожидает подтверждения");
+                      }
                       case CHUNK -> {
                         memoryAgentActive = false;
                         state.activeAgent.set(AgentType.MAIN_LLM);
@@ -296,6 +314,7 @@ public final class AppController implements AutoCloseable {
                       }
                       case RESPONSE -> {
                         memoryAgentActive = false;
+                        state.pendingPlan.set(null);
                         if (streamingMessageIndex < 0) {
                           state.messages.add(new ChatMessage("Nina", event.text()));
                         } else {
@@ -568,6 +587,7 @@ public final class AppController implements AutoCloseable {
                 pipeline.setFileSearchMaxVisited(120_000);
                 pipeline.setMainModelKey(mainModelKey);
                 pipeline.setMainContextWindowTokens(config.ctxSize());
+                pipeline.setMainParallel(config.parallel());
                 pipeline.setPromptSnapshot(
                     state.personalityPrompt(Profile.NORMAL).get(),
                     state.effectiveGeneralPrompt(),
@@ -865,6 +885,7 @@ public final class AppController implements AutoCloseable {
                 () -> {
                   if (closed || version != conversationVersion) return;
                   state.busy.set(false);
+                  state.pendingPlan.set(null); // plan panel never outlives the generation
                   refreshStatuses();
                   if (error != null) {
                     String text = "Ошибка: " + GenerationPipeline.message(error);
@@ -1353,6 +1374,18 @@ public final class AppController implements AutoCloseable {
       System.out.println("[FileTool] auto-confirmed: " + request.operation() + " " + request.path());
       return true;
     }
+    // Preferred UX: an approval block right inside the chat, with code highlighting.
+    if (content.getCenter() == chat) {
+      boolean accepted = chat.awaitFilePermission(request);
+      System.out.println("[FileTool] chat-card decision: " + (accepted ? "accepted" : "denied")
+          + " " + request.operation() + " " + request.path());
+      return accepted;
+    }
+    return showFilePermissionAlert(request);
+  }
+
+  /** Modal fallback for permission requests issued while the user is not on the chat page. */
+  private boolean showFilePermissionAlert(FilePermissionRequest request) {
     java.util.concurrent.CompletableFuture<Boolean> decision = new java.util.concurrent.CompletableFuture<>();
     Runnable show = () -> {
       try {
@@ -1365,6 +1398,7 @@ public final class AppController implements AutoCloseable {
           case "edit" -> "Изменить файл";
           case "patch" -> "Применить изменение";
           case "grep" -> "Искать внутри файлов";
+          case "delete" -> "Удалить файл или папку";
           default -> request.operation();
         };
         alert.setHeaderText(action + "?");

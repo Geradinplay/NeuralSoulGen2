@@ -1,15 +1,26 @@
 package com.neuralsoul.files;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.time.Duration;
 import java.util.*;
 
 /** Local filesystem operations exposed to the agent. Permission is enforced by GenerationPipeline. */
 public final class FileToolService {
   private static final int MAX_READ_CHARS = 180_000;
   private static final int MAX_GREP_MATCHES = 80;
+  private static final long MAX_DOWNLOAD_BYTES = 25L * 1024L * 1024L;
   private final FileSearchService search = new FileSearchService();
+  private final HttpClient downloadHttp = HttpClient.newBuilder()
+      .connectTimeout(Duration.ofSeconds(15))
+      .followRedirects(HttpClient.Redirect.NORMAL)
+      .build();
   private volatile List<String> preferredRoots = List.of();
 
   public void setSearchMaxVisited(int value) { search.setMaxVisited(value); }
@@ -28,11 +39,13 @@ public final class FileToolService {
       case "search" -> search(args);
       case "grep" -> grep(args);
       case "read" -> read(args);
+      case "download" -> download(args);
       case "write" -> write(args);
       case "edit" -> edit(args);
       case "patch" -> patch(args);
+      case "delete" -> delete(args);
       default -> "FILE_TOOL_ERROR: unknown operation '" + operation
-          + "'. Supported: roots, list, glob, search, grep, read, write, edit, patch.";
+          + "'. Supported: roots, list, glob, search, grep, read, download, write, edit, patch, delete.";
     };
   }
 
@@ -192,25 +205,131 @@ public final class FileToolService {
     return out.toString();
   }
 
+  /**
+   * write is create-only. Existing files must be changed deliberately with edit/patch;
+   * silently appending or truncating here would corrupt structured HTML/CSS/Java files.
+   */
   private String write(List<String> args) throws IOException {
     Path p = path(require(args, 0, "path"));
-    String content = require(args, 1, "content");
+    String content = unescapeLiteralEscapes(require(args, 1, "content"));
     Path parent = p.getParent();
     if (parent != null) Files.createDirectories(parent);
-    backup(p);
-    Files.writeString(p, content, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     Path actual = p.toAbsolutePath().normalize();
+    if (Files.isRegularFile(p)) {
+      return "FILE_TOOL_ERROR: file already exists: " + actual
+          + ". write is create-only and will not overwrite or append to an existing file. "
+          + "Read the relevant fragment and change it with "
+          + "[[FILE_TOOL:edit|" + actual + "|old text|new text]] or "
+          + "[[FILE_TOOL:patch|" + actual + "|old text|new text]].";
+    }
+    try {
+      Files.writeString(p, content, StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW);
+    } catch (FileAlreadyExistsException race) {
+      return "FILE_TOOL_ERROR: file already exists: " + actual
+          + ". Use edit/patch; write never overwrites existing files.";
+    }
     if (!Files.isRegularFile(actual))
       return "FILE_TOOL_ERROR: write returned but file was not found after creation: " + actual;
-    return "FILE_TOOL_RESULT write\nCreated/Written: " + actual
+    return "FILE_TOOL_RESULT write\nCreated: " + actual
         + "\nVerified: true\nSize: " + Files.size(actual) + " bytes"
         + "\nContent:\n" + content;
   }
 
+  /** Downloads one remote image into a new local file without loading it all into memory. */
+  private String download(List<String> args) throws IOException {
+    String rawUrl = require(args, 0, "image URL").trim();
+    Path destination = path(require(args, 1, "destination path"));
+    URI uri;
+    try {
+      uri = URI.create(rawUrl);
+    } catch (IllegalArgumentException badUri) {
+      return "FILE_TOOL_ERROR: invalid download URL: " + rawUrl;
+    }
+    String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
+    if (!scheme.equals("http") && !scheme.equals("https"))
+      return "FILE_TOOL_ERROR: download supports only http/https URLs: " + rawUrl;
+    if (uri.getHost() == null || uri.getHost().isBlank())
+      return "FILE_TOOL_ERROR: download URL has no host: " + rawUrl;
+    String destinationName = destination.getFileName() == null
+        ? "" : destination.getFileName().toString().toLowerCase(Locale.ROOT);
+    if (!destinationName.matches(".+\\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)$"))
+      return "FILE_TOOL_ERROR: image destination must use a supported extension "
+          + "(.png/.jpg/.jpeg/.gif/.webp/.svg/.avif/.bmp/.ico): " + destination;
+    if (Files.exists(destination))
+      return "FILE_TOOL_ERROR: destination already exists: " + destination
+          + ". download is create-only; choose another filename or explicitly delete the old asset first.";
+
+    Path parent = destination.getParent();
+    if (parent != null) Files.createDirectories(parent);
+    HttpRequest request = HttpRequest.newBuilder(uri)
+        .timeout(Duration.ofSeconds(60))
+        .header("User-Agent", "NeuralSoul/1.0 image-downloader")
+        .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*;q=0.9,*/*;q=0.1")
+        .GET().build();
+    HttpResponse<InputStream> response;
+    try {
+      response = downloadHttp.send(request, HttpResponse.BodyHandlers.ofInputStream());
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new IOException("image download interrupted", interrupted);
+    } catch (IllegalArgumentException requestFailure) {
+      return "FILE_TOOL_ERROR: invalid download request: " + requestFailure.getMessage();
+    }
+    int status = response.statusCode();
+    if (status < 200 || status >= 300) {
+      try (InputStream ignored = response.body()) { /* close response stream */ }
+      return "FILE_TOOL_ERROR: image download returned HTTP " + status + " for " + rawUrl;
+    }
+    long announced = response.headers().firstValueAsLong("Content-Length").orElse(-1L);
+    if (announced > MAX_DOWNLOAD_BYTES) {
+      try (InputStream ignored = response.body()) { /* close response stream */ }
+      return "FILE_TOOL_ERROR: remote image is too large (" + announced
+          + " bytes; limit " + MAX_DOWNLOAD_BYTES + ")";
+    }
+    String contentType = response.headers().firstValue("Content-Type")
+        .orElse("").split(";", 2)[0].trim().toLowerCase(Locale.ROOT);
+    if (contentType.contains("text/html") || contentType.contains("application/json")
+        || contentType.startsWith("text/plain")) {
+      try (InputStream ignored = response.body()) { /* close response stream */ }
+      return "FILE_TOOL_ERROR: URL returned " + contentType
+          + " instead of an image (possibly a web page or hotlink protection): " + rawUrl;
+    }
+
+    String prefix = destination.getFileName() == null ? "image" : destination.getFileName().toString();
+    if (prefix.length() < 3) prefix = "img" + prefix;
+    Path temp = Files.createTempFile(parent == null ? Path.of(".") : parent, prefix + ".", ".part");
+    long total = 0;
+    byte[] buffer = new byte[64 * 1024];
+    try (InputStream in = response.body(); java.io.OutputStream out = Files.newOutputStream(temp)) {
+      int n;
+      while ((n = in.read(buffer)) >= 0) {
+        if (n == 0) continue;
+        total += n;
+        if (total > MAX_DOWNLOAD_BYTES)
+          throw new IOException("remote image exceeded " + MAX_DOWNLOAD_BYTES + " byte limit");
+        out.write(buffer, 0, n);
+      }
+      if (total == 0) throw new IOException("remote server returned an empty image");
+      try {
+        Files.move(temp, destination, StandardCopyOption.ATOMIC_MOVE);
+      } catch (AtomicMoveNotSupportedException ignored) {
+        Files.move(temp, destination);
+      }
+    } catch (Exception failure) {
+      Files.deleteIfExists(temp);
+      if (failure instanceof IOException io) throw io;
+      throw new IOException("image download failed", failure);
+    }
+    return "FILE_TOOL_RESULT download\nDownloaded image: " + destination.toAbsolutePath().normalize()
+        + "\nSource: " + response.uri()
+        + "\nContent-Type: " + (contentType.isBlank() ? "unknown" : contentType)
+        + "\nVerified: true\nSize: " + total + " bytes";
+  }
+
   private String edit(List<String> args) throws IOException {
     Path p = path(require(args, 0, "path"));
-    String oldText = require(args, 1, "old text");
-    String newText = require(args, 2, "new text");
+    String oldText = unescapeLiteralEscapes(require(args, 1, "old text"));
+    String newText = unescapeLiteralEscapes(require(args, 2, "new text"));
     if (!Files.isRegularFile(p)) return "FILE_TOOL_ERROR: not a file: " + p;
     String original = Files.readString(p, StandardCharsets.UTF_8);
     int first = original.indexOf(oldText);
@@ -223,10 +342,93 @@ public final class FileToolService {
     return "FILE_TOOL_RESULT edit\nEdited: " + p;
   }
 
+  /**
+   * Small local models sometimes send escaped text like "line1\\nline2\\t\\tline3"
+   * with literal backslash-n sequences instead of real line breaks (observed: a
+   * whole HTML page written on one line). When the argument contains no real
+   * newline at all but does contain escape sequences, expand them. Text that
+   * already has real newlines is left untouched, so intentional "\\n" inside code
+   * strings keeps its literal meaning.
+   */
+  static String unescapeLiteralEscapes(String value) {
+    if (value == null || value.indexOf('\n') >= 0) return value;
+    if (!value.contains("\\n") && !value.contains("\\t") && !value.contains("\\r")) return value;
+    return value
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\r", "\n");
+  }
+
   /** Focused exact replacement; named patch to match the higher-level agent vocabulary. */
   private String patch(List<String> args) throws IOException {
     String result = edit(args);
     return result.replaceFirst("FILE_TOOL_RESULT edit", "FILE_TOOL_RESULT patch");
+  }
+
+  /**
+   * Deletes a file or a directory tree. Every file is backed up to a sibling
+   * ".neuralsoul.bak" first, so deletions remain recoverable.
+   */
+  private String delete(List<String> args) throws IOException {
+    Path p = path(require(args, 0, "path"));
+    if (!Files.exists(p)) return "FILE_TOOL_ERROR: path does not exist: " + p;
+    if (Files.isRegularFile(p)) {
+      Path backup = p.resolveSibling(p.getFileName() + ".neuralsoul.bak");
+      Files.move(p, backup, StandardCopyOption.REPLACE_EXISTING);
+      return "FILE_TOOL_RESULT delete\nDeleted: " + p + "\nBackup: " + backup;
+    }
+    if (!Files.isDirectory(p)) return "FILE_TOOL_ERROR: unsupported path type: " + p;
+    List<Path> all;
+    try (var stream = Files.walk(p)) {
+      all = stream.sorted(Comparator.reverseOrder()).toList();
+    }
+    int files = 0;
+    int dirs = 0;
+    for (Path item : all) {
+      if (Files.isRegularFile(item)) {
+        backup(item);
+        files++;
+      } else if (Files.isDirectory(item)) {
+        dirs++;
+      }
+    }
+    for (Path item : all) Files.deleteIfExists(item);
+    return "FILE_TOOL_RESULT delete\nDeleted directory tree: " + p.toAbsolutePath().normalize()
+        + "\nFiles: " + files + ", directories: " + dirs;
+  }
+
+  /**
+   * Resolves a path for actual tool execution. A bare relative name (e.g. "index.html")
+   * must never anchor to the application's own working directory: the model could then
+   * read or mutate NeuralSoul's own files by accident. Such paths are anchored to the
+   * configured preferred roots (the user's project folders) instead; if the file does
+   * not exist there, the first preferred root is used so the resulting FILE_TOOL_ERROR
+   * shows the intended absolute path and the model can retry via search.
+   */
+  public String resolveToolPath(String raw) {
+    String value = raw == null ? "" : raw.trim();
+    if (isBareRelative(value)) {
+      List<String> roots = preferredRoots;
+      String windowsStyle = value.replace('/', '\\');
+      for (String root : roots) {
+        Path candidate = Path.of(root, windowsStyle).normalize();
+        if (Files.exists(candidate)) return candidate.toString();
+      }
+      if (!roots.isEmpty()) {
+        return Path.of(roots.get(0), windowsStyle).normalize().toString();
+      }
+    }
+    return resolvePath(value);
+  }
+
+  /** True for names like "index.html" or "subdir\file.txt" — no drive, UNC, ~ or %var% prefix. */
+  private static boolean isBareRelative(String value) {
+    if (value.isBlank()) return false;
+    String v = value.replace('/', '\\');
+    if (v.startsWith("\\\\") || (v.length() >= 2 && v.charAt(1) == ':')) return false;
+    if (v.startsWith("~") || v.startsWith("%")) return false;
+    return !Path.of(v).isAbsolute();
   }
 
   private static void backup(Path p) throws IOException {

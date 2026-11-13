@@ -66,7 +66,7 @@ public final class Composer extends VBox {
     getChildren().add(Ui.row(fresh, Ui.spacer(), clip, mic, listenText, listen, voiceText, voice, cancel, submit));
     ToggleGroup modes = new ToggleGroup();
     FlowPane modeRow = new FlowPane(7, 7);
-    for (String name : new String[] {"Обычный", "Глубокий анализ"}) {
+    for (String name : new String[] {"Обычный", "Глубокий анализ", "Разработка"}) {
       ToggleButton b = new ToggleButton(name);
       b.setToggleGroup(modes);
       b.setSelected(name.equals(state.mode.get()));

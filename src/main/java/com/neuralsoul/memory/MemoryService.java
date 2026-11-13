@@ -40,7 +40,8 @@ public interface MemoryService {
         || s.contains("к сожалению") || s.contains("i'm sorry") || s.contains("i am sorry");
     boolean inability =
         s.contains("не могу") || s.contains("не удалось") || s.contains("не знаю")
-        || s.contains("нет доступа") || s.contains("не нашл") || s.contains("cannot")
+        || s.contains("произошла ошибка") || s.contains("ошибка при попытке")
+        || s.contains("попробую снова") || s.contains("нет доступа") || s.contains("не нашл") || s.contains("cannot")
         || s.contains("can't") || s.contains("unable to");
     if (apology && inability) return true;
     // Explicit near-zero confidence failure answers are also refusal-shaped.
@@ -49,4 +50,9 @@ public interface MemoryService {
   default List<MemoryRecord> search(String query, int limit, double minScore) { return List.of(); }
   default List<MemoryRecord> searchDeep(String query, int limit, double minScore) { return search(query, limit, minScore); }
   default void synchronize() throws Exception {}
+  /**
+   * Returns the last semantic-index (BGE) save failure in a model-readable form, or null.
+   * Reading consumes the value: the next context build injects it as a warning turn.
+   */
+  default String consumeLastSemanticFailure() { return null; }
 }

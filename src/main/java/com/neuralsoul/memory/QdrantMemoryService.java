@@ -19,6 +19,8 @@ public final class QdrantMemoryService implements MemoryService {
   private final ExecutorService recallPool = Executors.newFixedThreadPool(2, r -> { Thread t=new Thread(r,"memory-recall"); t.setDaemon(true); return t; });
   private final URI base;
   private volatile boolean semanticEnabled = true;
+  /** Last semantic (BGE) save failure, model-readable; consumed by the next context build. */
+  private volatile String lastSemanticFailure;
 
   public QdrantMemoryService(LocalMemoryService local, String baseUrl) {
     this(local, baseUrl, "neuralsoul_memory", "neuralsoul_memory_bge_m3");
@@ -44,7 +46,12 @@ public final class QdrantMemoryService implements MemoryService {
   public void delete(String id){
     // Qdrant point deletion is a POST action with a PointIdsList selector.
     request("POST","collections/"+collection+"/points/delete?wait=true", Json.write(Map.of("points",List.of(id))));
-    try { request("POST","collections/"+bgeCollection+"/points/delete?wait=true", Json.write(Map.of("points",List.of(id)))); } catch (Exception e) { System.out.println("[Memory/BGE] delete warning: "+e); }
+    // Semantic index may hold the record split into "#pN" chunk points after a
+    // too-large embedding retry; delete those alongside the base id.
+    List<Object> semanticIds=new ArrayList<>();
+    semanticIds.add(id);
+    for(int i=1;i<=8;i++) semanticIds.add(id+"#p"+i);
+    try { request("POST","collections/"+bgeCollection+"/points/delete?wait=true", Json.write(Map.of("points",semanticIds))); } catch (Exception e) { System.out.println("[Memory/BGE] delete warning: "+e); }
     local.delete(id);
   }
   public void clear(){
@@ -197,14 +204,87 @@ public final class QdrantMemoryService implements MemoryService {
     if (!semanticEnabled) return;
     try {
       ensureBgeCollection();
-      Map<String,Object> semantic=new LinkedHashMap<>();
-      semantic.put("id",r.id());
-      semantic.put("vector",floats(bge.embed(r.text())));
-      semantic.put("payload",point.get("payload"));
-      request("PUT","collections/"+bgeCollection+"/points?wait=true",Json.write(Map.of("points",List.of(semantic))));
+      upsertSemantic(r.id(), r.text(), point.get("payload"));
+      lastSemanticFailure = null;
     } catch(Exception e) {
       System.out.println("[Memory/BGE] upsert failed, fast index kept: "+e);
+      String reason = describeSemanticFailure(e);
+      // BGE-M3 rejects inputs above its embedding batch size (512 tokens by default).
+      // Split the record into smaller parts and index each part, so long reports are
+      // not silently lost from semantic recall.
+      if (isTooLargeError(e) && r.text().length() > 600) {
+        try {
+          int n = 0;
+          for (String part : splitForEmbedding(r.text())) {
+            n++;
+            upsertSemantic(r.id() + "#p" + n, part, point.get("payload"));
+          }
+          lastSemanticFailure = null;
+          System.out.println("[Memory/BGE] upsert recovered: text split into " + n + " parts");
+        } catch(Exception e2) {
+          System.out.println("[Memory/BGE] chunked upsert failed: "+e2);
+          lastSemanticFailure = reason;
+        }
+      } else {
+        lastSemanticFailure = reason;
+      }
     }
+  }
+
+  private void upsertSemantic(String id,String text,Object payload)throws Exception{
+    ensureBgeCollection();
+    Map<String,Object> semantic=new LinkedHashMap<>();
+    semantic.put("id",id);
+    semantic.put("vector",floats(bge.embed(text)));
+    semantic.put("payload",payload);
+    request("PUT","collections/"+bgeCollection+"/points?wait=true",Json.write(Map.of("points",List.of(semantic))));
+  }
+
+  /**
+   * True when the embedding server rejected the input because it exceeds the
+   * physical batch size ("input (N tokens) is too large to process...").
+   */
+  private static boolean isTooLargeError(Exception e){
+    return String.valueOf(e).contains("is too large to process");
+  }
+
+  /** Model-readable reason line; used to tell the Main LLM why a memory save failed. */
+  private static String describeSemanticFailure(Exception e){
+    String m=String.valueOf(e);
+    java.util.regex.Matcher t=java.util.regex.Pattern
+        .compile("input \\((\\d+) tokens\\) is too large to process[^\\\\\"]*(?:batch size: (\\d+))?")
+        .matcher(m);
+    if (t.find()) {
+      String batch = t.group(2) == null ? "" : " (лимит батча: " + t.group(2) + " токенов)";
+      return "запись " + t.group(1) + " токенов слишком длинная для эмбеддинга" + batch;
+    }
+    return m.length() > 200 ? m.substring(0, 200) + "…" : m;
+  }
+
+  /** Splits text into parts of ~1200 chars at line/space boundaries for BGE embedding. */
+  static List<String> splitForEmbedding(String text){
+    List<String> parts=new ArrayList<>();
+    int max=1200;
+    int from=0;
+    while(from<text.length()){
+      int end=Math.min(from+max,text.length());
+      if(end<text.length()){
+        int cut=Math.max(text.lastIndexOf('\n',end),text.lastIndexOf(' ',end));
+        if(cut>from+200) end=cut+1;
+      }
+      String part=text.substring(from,end).strip();
+      if(!part.isBlank()) parts.add(part);
+      from=end;
+    }
+    if(parts.isEmpty()) parts.add(text.strip());
+    return parts;
+  }
+
+  @Override
+  public String consumeLastSemanticFailure(){
+    String f=lastSemanticFailure;
+    lastSemanticFailure=null;
+    return f;
   }
   private List<Double> floats(float[] v){List<Double>x=new ArrayList<>(v.length);for(float f:v)x.add((double)f);return x;}
   private String request(String method,String path,String body){

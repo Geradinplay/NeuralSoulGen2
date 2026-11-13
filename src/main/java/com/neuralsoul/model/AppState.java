@@ -71,6 +71,11 @@ public final class AppState {
   /** Number of recognized voice phrases waiting for the current response to finish. */
   public final IntegerProperty voiceBufferSize = new SimpleIntegerProperty(0);
 
+  /** Development mode: pending plan text waiting for approve/edit/reject in the chat UI, or null. */
+  public final ObjectProperty<String> pendingPlan = new javafx.beans.property.SimpleObjectProperty<>(null);
+  /** Wired by AppController to pipeline.resolvePlan(generationId, decision). */
+  public volatile java.util.function.Consumer<com.neuralsoul.pipeline.GenerationPipeline.PlanDecision> planDecisionHandler;
+
   public final BooleanProperty recording = new SimpleBooleanProperty(false);
   public final StringProperty voiceListenerStatus = new SimpleStringProperty("Выключено");
   public final StringProperty llmStatus = new SimpleStringProperty("Отключён"),
