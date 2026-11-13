@@ -34,7 +34,7 @@ jobs:
             architectures: 75;80;86;89;90;100;120
             package: cuda-13.5
             # CUDA 13 split compiler CRT headers and NVVM out of the nvcc package.
-            cuda_subpackages: '["nvcc", "crt", "nvvm", "cudart", "cudart_dev", "cublas", "cublas_dev", "visual_studio_integration"]'
+            cuda_subpackages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "visual_studio_integration"]'
 
     steps:
       - name: Checkout NeuralSoul
