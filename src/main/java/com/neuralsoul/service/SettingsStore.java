@@ -7,6 +7,7 @@ import java.util.*;
 import java.util.prefs.Preferences;
 
 public final class SettingsStore {
+  private static final int FILE_TOOLS_PROMPT_VERSION = 3;
   private final ConfigLocator configs;
   private final ConfigLoader<GuiConfig> legacyLoader;
   private Map<String, String> values = new LinkedHashMap<>();
@@ -75,6 +76,14 @@ public final class SettingsStore {
     }
   }
 
+  private int getInt(String k, int fallback) {
+    try {
+      return Integer.parseInt(values.getOrDefault(k, Integer.toString(fallback)));
+    } catch (NumberFormatException e) {
+      return fallback;
+    }
+  }
+
   private String get(String k, String fallback) {
     return values.getOrDefault(k, fallback);
   }
@@ -85,8 +94,18 @@ public final class SettingsStore {
 
   public void load(AppState s) {
     values = new LinkedHashMap<>(gui().values());
-    for (var role : com.neuralsoul.config.AgentPrompts.roles())
-      s.agentPrompt(role).set(get("agents.system." + role.name(), com.neuralsoul.config.AgentPrompts.defaultPrompt(role)));
+    for (var role : com.neuralsoul.config.AgentPrompts.roles()) {
+      String prompt = get("agents.system." + role.name(),
+          com.neuralsoul.config.AgentPrompts.defaultPrompt(role));
+      if (role == ModelRole.FILE_SEARCH
+          && getInt("files.promptVersion", 0) < FILE_TOOLS_PROMPT_VERSION) {
+        // Replace the former advisory prompt once: it allowed the model to print code and ask
+        // the user to edit manually instead of executing deterministic write/edit/patch tools.
+        prompt = com.neuralsoul.config.AgentPrompts.defaultPrompt(role);
+        put("files.promptVersion", FILE_TOOLS_PROMPT_VERSION);
+      }
+      s.agentPrompt(role).set(prompt);
+    }
     values.forEach((key, value) -> {
       if (key.startsWith("agents.general.system.")) {
         try {
@@ -247,6 +266,7 @@ public final class SettingsStore {
       put("agents.general.system." + java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(key.getBytes(java.nio.charset.StandardCharsets.UTF_8)), value));
     for (var role : com.neuralsoul.config.AgentPrompts.roles())
       put("agents.system." + role.name(), s.agentPrompt(role).get());
+    put("files.promptVersion", FILE_TOOLS_PROMPT_VERSION);
     s.snapshotActiveProfile(s.activeProfile.get());
     put("voice", s.voice.get());
     put("voice.alwaysListen", s.alwaysListen.get());

@@ -317,6 +317,15 @@ MEMORY RECALL TOOL:
       speakThisTurn = true;
       System.out.println("[CosyVoice] LLM voice output enabled by CosyVoice model settings (legacy voice toggle is off)");
     }
+    if (speakThisTurn
+        && services.tts() instanceof RoutingTtsService routing
+        && !routing.isCosyEnabled()) {
+      // Speech was requested, but TTS is disabled in the Voice tab. Without this gate the
+      // per-pass streaming is skipped, yet the final speak block still dialed the disabled
+      // runtime (legacy engine at :5002) and failed every turn with ConnectException.
+      speakThisTurn = false;
+      System.out.println("[TTS/Pipeline] TTS is disabled in voice settings; speech skipped for generation=" + id);
+    }
     System.out.println("[TTS/Pipeline] generation=" + id + " speak=" + speakThisTurn);
     TtsTrace.log("g" + id, "REQUEST_GATE", "speakArgument=" + speak
         + " finalSpeak=" + speakThisTurn + " profile=" + profile
@@ -382,6 +391,11 @@ MEMORY RECALL TOOL:
     String lastAgentResult = null;
     String lastToolLabel = null;
     String lastToolResult = null;
+    boolean fileMutationCompleted = false;
+    int rejectedFileMutationDrafts = 0;
+    boolean enforceFileMutation = agentSystemPrompt(ModelRole.FILE_SEARCH)
+        .contains("[FILE_TOOLS_POLICY:ENFORCE_MUTATIONS]")
+        && isFileMutationRequest(text, initialMessages);
 
     for (int step = 1; step <= maxSteps; step++) {
       check(id);
@@ -438,6 +452,41 @@ MEMORY RECALL TOOL:
         finalPass = filter.visibleText();
         TtsTrace.log(ttsTraceId, "LLM_PASS_END", "visibleChars=" + finalPass.length()
             + " step=" + step);
+        if (enforceFileMutation && !fileMutationCompleted) {
+          if (activeSpeechQueue != null) {
+            activeSpeechQueue.cancel();
+            if (activeTtsQueue == activeSpeechQueue) activeTtsQueue = null;
+          }
+          rejectedFileMutationDrafts++;
+          System.out.println("[FileTool/Policy] rejected non-executing mutation draft #"
+              + rejectedFileMutationDrafts + " chars=" + finalPass.length());
+          if (rejectedFileMutationDrafts >= 3 || step == maxSteps) {
+            // Honest degradation instead of killing the whole turn: the model ignored the
+            // tools, but the user still gets the draft plus an explicit warning that no
+            // file was actually changed.
+            TtsTrace.log(ttsTraceId, "FILE_TOOL_POLICY_GIVEUP", "attempts=" + rejectedFileMutationDrafts);
+            System.out.println("[FileTool/Policy] giving up after " + rejectedFileMutationDrafts
+                + " attempts; returning the draft with a warning");
+            speak = false; // never read the rejected code dump aloud
+            String policyWarning = "⚠ Модель " + rejectedFileMutationDrafts
+                + " раза проигнорировала инструменты File Tools, и файлы НЕ были изменены. "
+                + "Ниже её ответ как есть.";
+            emit(id, PipelineEvent.Type.WARNING, policyWarning);
+            break;
+          }
+          // Repeat the editable GUI policy instead of adding hidden behavioural rules.
+          working.add(new ConversationTurn("system",
+              "FILE_TOOL_POLICY_VALIDATION_FAILED: предыдущий ответ не соответствует "
+                  + "активному GUI-промту File Tools. Следуй редактируемому GUI-промту ниже.\n\n"
+                  + agentSystemPrompt(ModelRole.FILE_SEARCH)
+                  + "\n\nSTRICT RULES FOR YOUR NEXT REPLY:\n"
+                  + "- Do NOT paste file contents or ``` code blocks into the chat text. Such answers are always rejected.\n"
+                  + "- Your next reply must perform the change itself: a single [[FILE_TOOL:write|path|content]] (create/replace), [[FILE_TOOL:edit|path|old text|new text]] or [[FILE_TOOL:patch|path|old text|new text]] call.\n"
+                  + "- If the full content does not fit in one pass, build the file incrementally across steps: first [[FILE_TOOL:write|path|first part]], then append the remaining parts with [[FILE_TOOL:edit|path|last line of previous part|that line plus the next part]].\n"
+                  + "- Do not write explanations before the tool call."));
+          finalPass = null;
+          continue;
+        }
         if (activeSpeechQueue != null) {
           // Let audio play concurrently with the final answer/bookkeeping.
           activeSpeechQueue.finish();
@@ -530,6 +579,11 @@ MEMORY RECALL TOOL:
         }
         System.out.println("[DeepAnalysis] FILE_TOOL " + fileToolCall.operation() + " args=" + fileToolCall.args().size());
         String toolResult = executeFileTool(id, profile, fileToolCall);
+        if (Set.of("write", "edit", "patch").contains(
+            fileToolCall.operation().toLowerCase(Locale.ROOT))
+            && toolResult.startsWith("FILE_TOOL_RESULT")) {
+          fileMutationCompleted = true;
+        }
         if ("list".equalsIgnoreCase(fileToolCall.operation())) {
           consecutiveListCalls++;
         } else {
@@ -1485,6 +1539,32 @@ Reply in the user's language.
     String text = value == null ? "" : value;
     int max = 30_000;
     return text.length() <= max ? text : text.substring(0, max) + "\n[PREVIEW TRUNCATED]";
+  }
+
+  private static final java.util.regex.Pattern FILE_MUTATION_INTENT =
+      java.util.regex.Pattern.compile(
+          "(?iu)(?:\\b(?:create|write|edit|change|update|modify|implement|fix|add)\\b"
+              + "|(?:создай|создать|добавь|добавить|измени|изменить|обнови|обновить|"
+              + "исправь|исправить|сделай|сделать|реализуй|реализовать|вставь|вставить)"
+              + "|ничего.{0,24}(?:не\\s+)?(?:поменял|изменил|создал))");
+  private static final java.util.regex.Pattern FILE_CONTEXT_CUE =
+      java.util.regex.Pattern.compile(
+          "(?iu)(?:[a-z]:[\\\\/]|(?:^|[\\s`\"'])(?:[^\\s`\"']+\\.)"
+              + "(?:html?|css|js|ts|java|py|json|ya?ml|xml|md|txt|properties)\\b"
+              + "|\\b(?:файл|папк|проект|страниц|сайт|код|file|folder|directory|project)\\w*)");
+
+  private static boolean isFileMutationRequest(
+      String userText, List<ConversationTurn> initialMessages) {
+    String current = userText == null ? "" : userText;
+    if (!FILE_MUTATION_INTENT.matcher(current).find()) return false;
+    if (FILE_CONTEXT_CUE.matcher(current).find()) return true;
+    if (initialMessages == null || initialMessages.isEmpty()) return false;
+    int from = Math.max(0, initialMessages.size() - 6);
+    for (int i = from; i < initialMessages.size(); i++) {
+      String content = initialMessages.get(i).content();
+      if (content != null && FILE_CONTEXT_CUE.matcher(content).find()) return true;
+    }
+    return false;
   }
 
   private record FileToolCall(String operation, List<String> args, String raw) {}

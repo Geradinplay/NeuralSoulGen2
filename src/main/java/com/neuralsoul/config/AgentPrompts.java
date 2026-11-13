@@ -90,6 +90,13 @@ Protocol: [[FILE_TOOL:roots]], [[FILE_TOOL:list|path]], [[FILE_TOOL:glob|root|pa
 Do not guess file contents.
 Use search for fuzzy path discovery, glob for wildcard paths, grep for content, and read only when contents are needed. Use write/edit/patch for changes. Stop after emitting one tool call and wait for its result. Never expose internal tool commands to the user.
 
+Mandatory execution rule:
+- When the user asks you to create, add, change, improve, fix, implement, or update files, perform the change with File Tools in this turn.
+- A follow-up such as "add it", "change it", or "do it yourself" refers to the file/project established by the conversation. Locate or read it if needed, then write/edit/patch it.
+- Do not answer with instructions telling the user to create or edit files manually when File Tools can perform the requested work.
+- Do not merely print a proposed code block. Apply it to the real file first, then briefly report the files actually changed.
+- Never claim a file was changed unless a write/edit/patch result confirmed success.
+
 ==================================================
 PRESERVE USER INPUT
 ==================================================
@@ -243,9 +250,13 @@ When the runtime asks for a query, return one concise WEB_SEARCH query and nothi
   if (role == ModelRole.FILE_SEARCH) return """
 FILE TOOL:
 Use File Tool for real filesystem operations. Never invent paths.
+[FILE_TOOLS_POLICY:ENFORCE_MUTATIONS]
 Protocol: [[FILE_TOOL:roots]], [[FILE_TOOL:list|path]], [[FILE_TOOL:glob|root|pattern]], [[FILE_TOOL:search|name]], [[FILE_TOOL:grep|path|regex]], [[FILE_TOOL:read|path|offset|limit]], [[FILE_TOOL:write|path|content]], [[FILE_TOOL:edit|path|old text|new text]], [[FILE_TOOL:patch|path|old text|new text]].
 
 Tool selection rules:
+- MANDATORY: if the user asks to create, add, change, improve, fix, implement, or update files, execute write/edit/patch in this turn. Do not substitute instructions or a proposed code block for the real change.
+- Follow-up phrases such as "add it", "change it", "do it yourself", and pronouns refer to the file/project already established in the conversation. Locate/read it when necessary and then modify it.
+- Never tell the user to create or edit a file manually when File Tool can do it. Report success only after FILE_TOOL_RESULT confirms it.
 - If filesystem roots are unknown, call roots once.
 - If you need to FIND a file or directory and do not know its exact path, use search. Search is recursive; do not manually walk the directory tree with repeated list calls.
 - Always use the narrowest known root. If the user says the target is on Desktop, search Desktop first instead of the whole drive.
