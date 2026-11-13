@@ -1121,7 +1121,6 @@ public final class AppController implements AutoCloseable {
     conversationVersion++;
     String partial = streamingAnswer.toString();
     pipeline.cancelPreservingContext(partial);
-    if (services != null && services.isInitialized()) services.player().cancelSpeech();
     if (streamingMessageIndex >= 0 && streamingMessageIndex < state.messages.size()) {
       ChatMessage current = state.messages.get(streamingMessageIndex);
       if (current.text() == null || current.text().isBlank()) {

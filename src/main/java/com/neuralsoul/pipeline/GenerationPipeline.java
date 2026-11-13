@@ -414,11 +414,14 @@ MEMORY RECALL TOOL:
     final String stepLimitLabel = unlimitedSteps ? "∞" : String.valueOf(maxSteps);
     List<ConversationTurn> working = new ArrayList<>(initialMessages);
     Set<String> executedCalls = new HashSet<>();
+    Map<String, String> fileToolResults = new HashMap<>();
     Map<String, String> agentResults = new HashMap<>();
     boolean suppressLongTermMemory = working.stream()
         .map(ConversationTurn::content)
         .anyMatch(GenerationPipeline::isUnverifiedWebResult);
     int consecutiveListCalls = 0;
+    String lastDuplicateFileCallKey = null;
+    int duplicateFileCallStreak = 0;
     String finalPass = null;
     StreamingSpeechQueue pendingSpeechQueue = null;
     AgentCall lastAgentCall = null;
@@ -440,9 +443,9 @@ MEMORY RECALL TOOL:
     for (int step = 1; unlimitedSteps || step <= maxSteps; step++) {
       check(id);
       System.out.println("[Main/Turn] step " + step + "/" + stepLimitLabel);
-      String ttsTraceId = "g" + id + "-p" + step;
-      TtsTrace.log(ttsTraceId, "LLM_PASS_START", "step=" + step + "/" + stepLimitLabel
-          + " speak=" + speak + " model=" + model + " messages=" + working.size());
+      String ttsTraceId = speak ? "g" + id + "-p" + step : null;
+      if (speak) TtsTrace.log(ttsTraceId, "LLM_PASS_START", "step=" + step + "/" + stepLimitLabel
+          + " speak=true model=" + model + " messages=" + working.size());
       emit(id, PipelineEvent.Type.STATUS, "Обработка запроса · шаг " + step);
 
       if (!unlimitedSteps && step == maxSteps) {
@@ -454,43 +457,28 @@ MEMORY RECALL TOOL:
                 + "честно укажи, чего не хватает."));
       }
 
-      // Buffer the pass until we know it is a final answer, not a tool preamble.
-      // Speak text as it arrives. Tool calls cancel speculative speech immediately;
-      // each iteration gets a fresh queue so discarded agent drafts never continue playing.
+      // Buffer every pass until it is known to be the final answer. TTS is deliberately
+      // NOT initialized here: intermediate reasoning/tool preambles must never be spoken.
+      // Only the final answer is synthesized after the loop.
       StreamingSpeechQueue speechQueue = null;
-      if (speak && services.tts() instanceof RoutingTtsService routing && routing.isCosyEnabled()) {
-        SpeechGenerationSettingsStore.Common ttsOptions =
-            new SpeechGenerationSettingsStore(configs.directory()).load().common();
-        // Cold start happens once, before LLM streaming, avoiding queue overflow while the GGUF loads.
-        // A failed startup must not prevent the main text answer.
-        try {
-          TtsTrace.log(ttsTraceId, "TTS_INITIALIZE", "requesting persistent runtime");
-          ensure(services.tts());
-          speechQueue = new StreamingSpeechQueue(services.tts(), services.player(), ttsOptions, ttsTraceId);
-          activeTtsQueue = speechQueue;
-        } catch (Exception ttsStartError) {
-          TtsTrace.log(ttsTraceId, "TTS_INITIALIZE_FAILED", message(ttsStartError));
-          System.err.println("[CosyVoice] startup failed: " + message(ttsStartError));
-        }
-      } else {
-        TtsTrace.log(ttsTraceId, "TTS_STREAM_SKIPPED", "speak=" + speak
-            + " cosyEnabled=" + (services.tts() instanceof RoutingTtsService routing && routing.isCosyEnabled()));
-      }
       final StreamingSpeechQueue activeSpeechQueue = speechQueue;
       StreamingMemoryToolFilter filter = new StreamingMemoryToolFilter(profile, ttsTraceId,
-          chunk -> { if (activeSpeechQueue != null) activeSpeechQueue.accept(chunk); });
+          chunk -> {});
 
       MemoryRecallCall memoryCall = null;
       FileToolCall fileToolCall = null;
       AgentCall agentCall = null;
       String assistantTurn;
       try {
-        try (TtsTrace.Scope traceScope = TtsTrace.with(ttsTraceId)) {
+        if (speak) try (TtsTrace.Scope traceScope = TtsTrace.with(ttsTraceId)) {
+          services.llm().generateStreaming(working, model, filter::accept);
+          filter.finish();
+        } else {
           services.llm().generateStreaming(working, model, filter::accept);
           filter.finish();
         }
         finalPass = filter.visibleText();
-        TtsTrace.log(ttsTraceId, "LLM_PASS_END", "visibleChars=" + finalPass.length()
+        if (speak) TtsTrace.log(ttsTraceId, "LLM_PASS_END", "visibleChars=" + finalPass.length()
             + " step=" + step);
         if (fileToolFailurePending || (enforceFileMutation && !fileMutationCompleted)) {
           if (activeSpeechQueue != null) {
@@ -505,7 +493,7 @@ MEMORY RECALL TOOL:
             // Honest degradation instead of killing the whole turn: the model ignored the
             // tools, but the user still gets the draft plus an explicit warning that no
             // file was actually changed.
-            TtsTrace.log(ttsTraceId, "FILE_TOOL_POLICY_GIVEUP", "attempts=" + rejectedFileMutationDrafts);
+            if (speak) TtsTrace.log(ttsTraceId, "FILE_TOOL_POLICY_GIVEUP", "attempts=" + rejectedFileMutationDrafts);
             System.out.println("[FileTool/Policy] giving up after " + rejectedFileMutationDrafts
                 + " attempts; returning the draft with a warning");
             speak = false; // never read the rejected code dump aloud
@@ -540,7 +528,7 @@ MEMORY RECALL TOOL:
         }
         break; // no tool call => final answer
       } catch (MemoryToolDetected detected) {
-        TtsTrace.log(ttsTraceId, "LLM_TOOL_ROUTE", "tool=MemoryToolDetected cancelling speculative voice");
+        if (speak) TtsTrace.log(ttsTraceId, "LLM_TOOL_ROUTE", "tool=MemoryToolDetected");
         if (activeSpeechQueue != null) {
           activeSpeechQueue.cancel();
           if (activeTtsQueue == activeSpeechQueue) activeTtsQueue = null;
@@ -549,7 +537,7 @@ MEMORY RECALL TOOL:
         assistantTurn = filter.agentTextForContinuation()
             + formatCall(profile, ModelRole.MEMORY, memoryCall.query());
       } catch (FileToolDetected detected) {
-        TtsTrace.log(ttsTraceId, "LLM_TOOL_ROUTE", "tool=FileToolDetected cancelling speculative voice");
+        if (speak) TtsTrace.log(ttsTraceId, "LLM_TOOL_ROUTE", "tool=FileToolDetected");
         if (activeSpeechQueue != null) {
           activeSpeechQueue.cancel();
           if (activeTtsQueue == activeSpeechQueue) activeTtsQueue = null;
@@ -557,7 +545,7 @@ MEMORY RECALL TOOL:
         fileToolCall = detected.call();
         assistantTurn = filter.agentTextForContinuation() + fileToolCall.raw();
       } catch (AgentToolDetected detected) {
-        TtsTrace.log(ttsTraceId, "LLM_TOOL_ROUTE", "tool=AgentToolDetected cancelling speculative voice");
+        if (speak) TtsTrace.log(ttsTraceId, "LLM_TOOL_ROUTE", "tool=AgentToolDetected");
         if (activeSpeechQueue != null) {
           activeSpeechQueue.cancel();
           if (activeTtsQueue == activeSpeechQueue) activeTtsQueue = null;
@@ -565,7 +553,7 @@ MEMORY RECALL TOOL:
         agentCall = detected.call();
         assistantTurn = filter.agentTextForContinuation() + agentCall.raw();
       } catch (Exception | Error failure) {
-        TtsTrace.log(ttsTraceId, "LLM_PASS_FAILED", failure.getClass().getSimpleName()
+        if (speak) TtsTrace.log(ttsTraceId, "LLM_PASS_FAILED", failure.getClass().getSimpleName()
             + ": " + failure.getMessage());
         if (activeSpeechQueue != null) {
           activeSpeechQueue.cancel();
@@ -617,24 +605,55 @@ MEMORY RECALL TOOL:
       } else if (fileToolCall != null) {
         String key = "FILE_TOOL:" + fileToolCall.operation().toLowerCase(Locale.ROOT) + ":" + String.join("|", fileToolCall.args());
         if (!executedCalls.add(key)) {
-          System.out.println("[DeepAnalysis] duplicate tool call blocked: " + key);
-          working.add(new ConversationTurn("system", "This exact FILE_TOOL call was already executed. Use its result, change the operation/arguments, or finish."));
+          duplicateFileCallStreak = key.equals(lastDuplicateFileCallKey)
+              ? duplicateFileCallStreak + 1 : 1;
+          lastDuplicateFileCallKey = key;
+          String cached = fileToolResults.get(key);
+          System.out.println("[DeepAnalysis] duplicate tool call blocked: "
+              + abbreviateForLog(key, 240) + " streak=" + duplicateFileCallStreak);
+          if (duplicateFileCallStreak >= 2) {
+            // An unlimited agent loop must not spend minutes emitting the same read/edit.
+            // End deterministically after the second consecutive duplicate.
+            if (fileMutationCompleted && cached != null && !cached.startsWith("FILE_TOOL_ERROR")) {
+              System.out.println("[Main/Turn] repeated duplicate loop -> forced finalization from cached tool result");
+              finalPass = finalizeFromToolResult(id, text, model,
+                  new AgentCall(ModelRole.GENERAL, null,
+                      "FILE_TOOL: " + fileToolCall.operation(), ""), cached);
+            } else {
+              finalPass = "⚠ Выполнение остановлено: Main LLM несколько раз подряд повторила один и тот же "
+                  + "вызов File Tools. Успешное изменение файла в этой петле не подтверждено.";
+            }
+            break;
+          }
+          working.add(new ConversationTurn("system",
+              (cached == null ? "" : "CACHED_FILE_TOOL_RESULT (не вызывай инструмент повторно):\n" + cached + "\n")
+                  + "DUPLICATE_CALL_BLOCKED: этот точный FILE_TOOL уже выполнен. Используй результат выше. "
+                  + "Следующий ответ должен либо вызвать ДРУГОЙ инструмент с другими аргументами, либо быть "
+                  + "коротким финальным отчётом без инструментов."));
           continue;
         }
+        lastDuplicateFileCallKey = null;
+        duplicateFileCallStreak = 0;
         System.out.println("[DeepAnalysis] FILE_TOOL " + fileToolCall.operation() + " args=" + fileToolCall.args().size());
         String toolResult = executeFileTool(id, profile, fileToolCall);
+        fileToolResults.put(key, toolResult);
         boolean fileToolFailed = toolResult.startsWith("FILE_TOOL_ERROR");
         boolean mutatingFileTool = Set.of("write", "edit", "patch", "delete").contains(
             fileToolCall.operation().toLowerCase(Locale.ROOT));
         if (fileToolFailed) {
           // A failed attempt was not executed successfully, so allow the exact same
-          // corrected/retried call instead of blocking it as a duplicate.
-          executedCalls.remove(key);
+          // corrected/retried call twice. After repeated failures keep the key so an
+          // infinite-step development turn cannot hammer the exact same bad call forever.
           fileToolFailurePending = true;
           consecutiveFileToolErrors++;
+          if (consecutiveFileToolErrors < 3) executedCalls.remove(key);
           toolResult += "\nFILE_TOOL_RETRY_REQUIRED: Задача не выполнена. Не завершай ответом и не обещай "
               + "попробовать позже. Прочитай актуальный файл/найди точный путь, исправь аргументы и повтори "
               + "изменение сейчас. Попытка " + consecutiveFileToolErrors + ".";
+          if (consecutiveFileToolErrors >= 3) {
+            toolResult += "\nREPEATED_FAILURE_BREAKER: Этот точный вызов больше повторять нельзя. "
+                + "Смени операцию или аргументы; используй полный путь пользователя напрямую.";
+          }
           System.out.println("[FileTool/Policy] tool failed; retry required, streak="
               + consecutiveFileToolErrors + " result=" + abbreviateForLog(toolResult, 220));
         } else if (mutatingFileTool) {
@@ -700,6 +719,7 @@ MEMORY RECALL TOOL:
 
     String warning = "";
     if (speak) {
+      finalTtsActive = true;
       try {
         emit(id, PipelineEvent.Type.STATUS, "Синтез речи…");
         ensure(services.tts());
@@ -725,6 +745,8 @@ MEMORY RECALL TOOL:
         check(id);
         warning = "Ответ получен, но озвучивание недоступно: " + message(e);
         emit(id, PipelineEvent.Type.WARNING, warning);
+      } finally {
+        finalTtsActive = false;
       }
     }
     emit(id, PipelineEvent.Type.STATUS, warning.isEmpty() ? "Готово" : warning);
@@ -1772,9 +1794,9 @@ Reply in the user's language.
       if (chunk == null || chunk.isEmpty()) return;
       chunksSeen++;
       charactersSeen += chunk.length();
-      if (chunksSeen == 1) TtsTrace.log(traceId, "FILTER_FIRST_LLM_CHUNK",
+      if (traceId != null && chunksSeen == 1) TtsTrace.log(traceId, "FILTER_FIRST_LLM_CHUNK",
           "chunkChars=" + chunk.length());
-      else if (chunksSeen % 32 == 0) TtsTrace.log(traceId, "FILTER_LLM_PROGRESS",
+      else if (traceId != null && chunksSeen % 32 == 0) TtsTrace.log(traceId, "FILTER_LLM_PROGRESS",
           "chunks=" + chunksSeen + " receivedChars=" + charactersSeen
               + " visibleChars=" + visible.length() + " pendingChars=" + pending.length());
       pending.append(chunk);
@@ -1842,7 +1864,7 @@ Reply in the user's language.
 
     private void finish() {
       process(true);
-      TtsTrace.log(traceId, "FILTER_FINISHED", "chunks=" + chunksSeen
+      if (traceId != null) TtsTrace.log(traceId, "FILTER_FINISHED", "chunks=" + chunksSeen
           + " receivedChars=" + charactersSeen + " visibleChars=" + visible.length()
           + " pendingChars=" + pending.length());
     }
@@ -1853,7 +1875,7 @@ Reply in the user's language.
       visible.append(text);
       if (first || visible.length() - lastVisibleCheckpoint >= 300) {
         lastVisibleCheckpoint = visible.length();
-        TtsTrace.log(traceId, "FILTER_VISIBLE", "visibleChars=" + visible.length()
+        if (traceId != null) TtsTrace.log(traceId, "FILTER_VISIBLE", "visibleChars=" + visible.length()
             + " latestFragmentChars=" + text.length() + " pendingChars=" + pending.length());
       }
       visibleConsumer.accept(text);
@@ -2246,7 +2268,20 @@ Reply in the user's language.
     boolean needsPermission = op.equals("grep") || op.equals("read") || op.equals("write")
         || op.equals("edit") || op.equals("patch") || op.equals("delete");
     List<String> resolvedArgs = new ArrayList<>(call.args());
-    if (!resolvedArgs.isEmpty() && !op.equals("roots")) {
+    if (op.equals("search")) {
+      // Preferred syntax is search|query. Small models sometimes copy the protocol
+      // placeholder literally as search|name|index.html; treat "name" as a label,
+      // not as a directory path (the previous code resolved it to D:\NEGen2\name
+      // and could loop forever on the same error).
+      if (resolvedArgs.size() >= 2
+          && Set.of("name", "query", "имя", "запрос").contains(
+              resolvedArgs.get(0).trim().toLowerCase(Locale.ROOT))) {
+        resolvedArgs = new ArrayList<>(List.of(resolvedArgs.get(1)));
+      } else if (resolvedArgs.size() >= 2 && !resolvedArgs.get(1).isBlank()) {
+        resolvedArgs.set(0, fileTool.resolveToolPath(resolvedArgs.get(0)));
+      }
+      // A one-argument search contains a query, not a path: never resolve it.
+    } else if (!resolvedArgs.isEmpty() && !op.equals("roots")) {
       // Paths returned by roots/list/search are already concrete. resolveToolPath still
       // handles relative/env paths for direct read/write/edit/grep requests, and anchors
       // bare relative names to the preferred roots instead of the app's own CWD.
@@ -2551,9 +2586,13 @@ Reply in the user's language.
               } catch (InterruptedException | CancellationException e) {
                 StreamingSpeechQueue speechQueue = activeTtsQueue;
                 activeTtsQueue = null;
+                boolean cancelTts = finalTtsActive || speechQueue != null;
                 if (speechQueue != null) speechQueue.cancel();
-                services.tts().cancelSpeech();
-                services.player().cancelSpeech();
+                if (cancelTts) {
+                  services.tts().cancelSpeech();
+                  services.player().cancelSpeech();
+                }
+                finalTtsActive = false;
                 services.recorder().stop();
                 Thread.currentThread().interrupt();
                 result.cancel(false);
@@ -2578,7 +2617,8 @@ Reply in the user's language.
   public synchronized boolean cancelPreservingContext(String visiblePartialAnswer) {
     if (!isGenerating()) return false;
     long interruptedId = generation;
-    TtsTrace.log("g" + interruptedId, "CANCEL_PRESERVE_CONTEXT",
+    boolean cancelTts = finalTtsActive || activeTtsQueue != null;
+    if (cancelTts) TtsTrace.log("g" + interruptedId, "CANCEL_PRESERVE_CONTEXT",
         "activeQueue=" + (activeTtsQueue != null));
     String interruptedUser = activeRequestGeneration == interruptedId ? activeRequestText : "";
 
@@ -2589,9 +2629,12 @@ Reply in the user's language.
     if (speechQueue != null) speechQueue.cancel();
     if (task != null) task.cancel(true);
     if (pending != null) pending.cancel(false);
-    if (services.isInitialized()) {
+    if (services.isInitialized() && cancelTts) {
       services.tts().cancelSpeech();
       services.player().cancelSpeech();
+    }
+    finalTtsActive = false;
+    if (services.isInitialized()) {
       services.recorder().stop();
     }
 
@@ -2612,7 +2655,9 @@ Reply in the user's language.
   }
 
   public synchronized void cancel() {
-    TtsTrace.log("g" + generation, "CANCEL_USER", "activeQueue=" + (activeTtsQueue != null));
+    boolean cancelTts = finalTtsActive || activeTtsQueue != null;
+    if (cancelTts) TtsTrace.log("g" + generation, "CANCEL_USER",
+        "activeQueue=" + (activeTtsQueue != null));
     generation++;
     if (services.isInitialized()) services.llm().cancelGeneration();
     StreamingSpeechQueue speechQueue = activeTtsQueue;
@@ -2620,9 +2665,12 @@ Reply in the user's language.
     if (speechQueue != null) speechQueue.cancel();
     if (task != null) task.cancel(true);
     if (pending != null) pending.cancel(false);
-    if (services.isInitialized()) {
+    if (services.isInitialized() && cancelTts) {
       services.tts().cancelSpeech();
       services.player().cancelSpeech();
+    }
+    finalTtsActive = false;
+    if (services.isInitialized()) {
       services.recorder().stop();
     }
     activeRequestGeneration = -1;

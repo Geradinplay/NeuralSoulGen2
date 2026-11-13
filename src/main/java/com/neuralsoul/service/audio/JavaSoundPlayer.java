@@ -75,7 +75,8 @@ public final class JavaSoundPlayer implements AudioPlayer {
       try { legacy.stop(); legacy.flush(); legacy.close(); }
       catch (RuntimeException ignored) {}
     }
-    TtsTrace.log("PLAYER_DEVICE_STOP", "reason=system_shutdown");
+    if (old != null || legacy != null)
+      TtsTrace.log("PLAYER_DEVICE_STOP", "reason=system_shutdown");
   }
 
   /** Stop the CURRENT speech without destroying the long-lived audio device. */
@@ -88,7 +89,8 @@ public final class JavaSoundPlayer implements AudioPlayer {
       try { legacy.stop(); legacy.flush(); }
       catch (RuntimeException ignored) {}
     }
-    TtsTrace.log("PLAYER_SPEECH_CANCEL", "deviceRemainsOpen=" + (current != null && !current.closed));
+    if (current != null || legacy != null)
+      TtsTrace.log("PLAYER_SPEECH_CANCEL", "deviceRemainsOpen=" + (current != null && !current.closed));
   }
 
   private static AudioFormat pcmFormat(int sampleRate, int channels) {

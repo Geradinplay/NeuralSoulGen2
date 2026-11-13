@@ -1,26 +1,15 @@
 package com.neuralsoul.files;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
-import java.time.Duration;
 import java.util.*;
 
 /** Local filesystem operations exposed to the agent. Permission is enforced by GenerationPipeline. */
 public final class FileToolService {
   private static final int MAX_READ_CHARS = 180_000;
   private static final int MAX_GREP_MATCHES = 80;
-  private static final long MAX_DOWNLOAD_BYTES = 25L * 1024L * 1024L;
   private final FileSearchService search = new FileSearchService();
-  private final HttpClient downloadHttp = HttpClient.newBuilder()
-      .connectTimeout(Duration.ofSeconds(15))
-      .followRedirects(HttpClient.Redirect.NORMAL)
-      .build();
   private volatile List<String> preferredRoots = List.of();
 
   public void setSearchMaxVisited(int value) { search.setMaxVisited(value); }
@@ -39,13 +28,12 @@ public final class FileToolService {
       case "search" -> search(args);
       case "grep" -> grep(args);
       case "read" -> read(args);
-      case "download" -> download(args);
       case "write" -> write(args);
       case "edit" -> edit(args);
       case "patch" -> patch(args);
       case "delete" -> delete(args);
       default -> "FILE_TOOL_ERROR: unknown operation '" + operation
-          + "'. Supported: roots, list, glob, search, grep, read, download, write, edit, patch, delete.";
+          + "'. Supported: roots, list, glob, search, grep, read, write, edit, patch, delete.";
     };
   }
 
@@ -233,97 +221,6 @@ public final class FileToolService {
     return "FILE_TOOL_RESULT write\nCreated: " + actual
         + "\nVerified: true\nSize: " + Files.size(actual) + " bytes"
         + "\nContent:\n" + content;
-  }
-
-  /** Downloads one remote image into a new local file without loading it all into memory. */
-  private String download(List<String> args) throws IOException {
-    String rawUrl = require(args, 0, "image URL").trim();
-    Path destination = path(require(args, 1, "destination path"));
-    URI uri;
-    try {
-      uri = URI.create(rawUrl);
-    } catch (IllegalArgumentException badUri) {
-      return "FILE_TOOL_ERROR: invalid download URL: " + rawUrl;
-    }
-    String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
-    if (!scheme.equals("http") && !scheme.equals("https"))
-      return "FILE_TOOL_ERROR: download supports only http/https URLs: " + rawUrl;
-    if (uri.getHost() == null || uri.getHost().isBlank())
-      return "FILE_TOOL_ERROR: download URL has no host: " + rawUrl;
-    String destinationName = destination.getFileName() == null
-        ? "" : destination.getFileName().toString().toLowerCase(Locale.ROOT);
-    if (!destinationName.matches(".+\\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico)$"))
-      return "FILE_TOOL_ERROR: image destination must use a supported extension "
-          + "(.png/.jpg/.jpeg/.gif/.webp/.svg/.avif/.bmp/.ico): " + destination;
-    if (Files.exists(destination))
-      return "FILE_TOOL_ERROR: destination already exists: " + destination
-          + ". download is create-only; choose another filename or explicitly delete the old asset first.";
-
-    Path parent = destination.getParent();
-    if (parent != null) Files.createDirectories(parent);
-    HttpRequest request = HttpRequest.newBuilder(uri)
-        .timeout(Duration.ofSeconds(60))
-        .header("User-Agent", "NeuralSoul/1.0 image-downloader")
-        .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*;q=0.9,*/*;q=0.1")
-        .GET().build();
-    HttpResponse<InputStream> response;
-    try {
-      response = downloadHttp.send(request, HttpResponse.BodyHandlers.ofInputStream());
-    } catch (InterruptedException interrupted) {
-      Thread.currentThread().interrupt();
-      throw new IOException("image download interrupted", interrupted);
-    } catch (IllegalArgumentException requestFailure) {
-      return "FILE_TOOL_ERROR: invalid download request: " + requestFailure.getMessage();
-    }
-    int status = response.statusCode();
-    if (status < 200 || status >= 300) {
-      try (InputStream ignored = response.body()) { /* close response stream */ }
-      return "FILE_TOOL_ERROR: image download returned HTTP " + status + " for " + rawUrl;
-    }
-    long announced = response.headers().firstValueAsLong("Content-Length").orElse(-1L);
-    if (announced > MAX_DOWNLOAD_BYTES) {
-      try (InputStream ignored = response.body()) { /* close response stream */ }
-      return "FILE_TOOL_ERROR: remote image is too large (" + announced
-          + " bytes; limit " + MAX_DOWNLOAD_BYTES + ")";
-    }
-    String contentType = response.headers().firstValue("Content-Type")
-        .orElse("").split(";", 2)[0].trim().toLowerCase(Locale.ROOT);
-    if (contentType.contains("text/html") || contentType.contains("application/json")
-        || contentType.startsWith("text/plain")) {
-      try (InputStream ignored = response.body()) { /* close response stream */ }
-      return "FILE_TOOL_ERROR: URL returned " + contentType
-          + " instead of an image (possibly a web page or hotlink protection): " + rawUrl;
-    }
-
-    String prefix = destination.getFileName() == null ? "image" : destination.getFileName().toString();
-    if (prefix.length() < 3) prefix = "img" + prefix;
-    Path temp = Files.createTempFile(parent == null ? Path.of(".") : parent, prefix + ".", ".part");
-    long total = 0;
-    byte[] buffer = new byte[64 * 1024];
-    try (InputStream in = response.body(); java.io.OutputStream out = Files.newOutputStream(temp)) {
-      int n;
-      while ((n = in.read(buffer)) >= 0) {
-        if (n == 0) continue;
-        total += n;
-        if (total > MAX_DOWNLOAD_BYTES)
-          throw new IOException("remote image exceeded " + MAX_DOWNLOAD_BYTES + " byte limit");
-        out.write(buffer, 0, n);
-      }
-      if (total == 0) throw new IOException("remote server returned an empty image");
-      try {
-        Files.move(temp, destination, StandardCopyOption.ATOMIC_MOVE);
-      } catch (AtomicMoveNotSupportedException ignored) {
-        Files.move(temp, destination);
-      }
-    } catch (Exception failure) {
-      Files.deleteIfExists(temp);
-      if (failure instanceof IOException io) throw io;
-      throw new IOException("image download failed", failure);
-    }
-    return "FILE_TOOL_RESULT download\nDownloaded image: " + destination.toAbsolutePath().normalize()
-        + "\nSource: " + response.uri()
-        + "\nContent-Type: " + (contentType.isBlank() ? "unknown" : contentType)
-        + "\nVerified: true\nSize: " + total + " bytes";
   }
 
   private String edit(List<String> args) throws IOException {
