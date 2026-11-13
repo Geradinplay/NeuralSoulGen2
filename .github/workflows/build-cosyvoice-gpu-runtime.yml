@@ -27,7 +27,7 @@ jobs:
             cuda: 12.4.1
             architectures: 61;70;75;80;86;89;90
             package: cuda-12.4
-            cuda_subpackages: '["nvcc", "cudart", "cudart_dev", "cublas", "cublas_dev", "visual_studio_integration"]'
+            cuda_subpackages: '["nvcc", "cudart", "cublas", "visual_studio_integration"]'
           # CUDA 13.x covers Turing through Blackwell. Pascal/Volta belong to the 12.4 pack.
           - name: CUDA 13.x (Turing-Blackwell)
             cuda: 13.2.0
@@ -61,6 +61,31 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Install pinned frontend dependencies
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force deps/icu,deps/onnxruntime | Out-Null
+          Invoke-WebRequest `
+            'https://github.com/unicode-org/icu/releases/download/release-78.2/icu4c-78.2-Win64-MSVC2022.zip' `
+            -OutFile deps/icu.zip
+          Expand-Archive deps/icu.zip -DestinationPath deps/icu
+          $icuHeader = Get-ChildItem deps/icu -Recurse -File -Filter utypes.h |
+            Where-Object { $_.FullName -match '[\\/]include[\\/]unicode[\\/]utypes\.h$' } |
+            Select-Object -First 1
+          if (!$icuHeader) { throw 'Pinned ICU headers missing' }
+          $icuRoot = Split-Path (Split-Path $icuHeader.DirectoryName -Parent) -Parent
+
+          Invoke-WebRequest `
+            'https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-win-x64-1.24.4.zip' `
+            -OutFile deps/onnxruntime.zip
+          Expand-Archive deps/onnxruntime.zip -DestinationPath deps/onnxruntime
+          $ortHeader = Get-ChildItem deps/onnxruntime -Recurse -File -Filter onnxruntime_c_api.h |
+            Select-Object -First 1
+          if (!$ortHeader) { throw 'Pinned ONNX Runtime headers missing' }
+          $ortRoot = Split-Path $ortHeader.DirectoryName -Parent
+          "ICU_ROOT=$icuRoot" >> $env:GITHUB_ENV
+          "ORT_ROOT=$ortRoot" >> $env:GITHUB_ENV
+
       - name: Configure
         shell: pwsh
         run: |
@@ -74,6 +99,8 @@ jobs:
             -DGGML_NATIVE=OFF `
             -DGGML_CPU_ALL_VARIANTS=ON `
             -DGGML_RPC=ON `
+            "-DICU_PREBUILT_DIR=$env:ICU_ROOT" `
+            "-DORT_PREBUILT_DIR=$env:ORT_ROOT" `
             -DCOSYVOICE_NO_FRONTEND=OFF `
             -DCOSYVOICE_NO_ICU=OFF `
             -DCOSYVOICE_NO_AUDIO=OFF `
