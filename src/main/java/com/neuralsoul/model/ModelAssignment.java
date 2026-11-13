@@ -77,7 +77,7 @@ public final class ModelAssignment {
 
   private boolean allowedRole(ModelRole role) {
     if (role == null) return false;
-    if (memoryOnly) return role == ModelRole.MEMORY || role == ModelRole.FILE_SEARCH;
+    if (memoryOnly) return role == ModelRole.MEMORY;
     if (webSearchOnly) return role == ModelRole.WEB_SEARCH;
     return role != ModelRole.MEMORY && role != ModelRole.FILE_SEARCH
         && role != ModelRole.WEB_SEARCH;

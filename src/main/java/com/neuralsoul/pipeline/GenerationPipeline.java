@@ -8,8 +8,6 @@ import com.neuralsoul.service.api.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.Consumer;
-import com.neuralsoul.files.FileSearchService;
-import com.neuralsoul.files.FileSearchResult;
 import com.neuralsoul.files.FileToolService;
 import com.neuralsoul.service.http.Json;
 import com.neuralsoul.files.FilePermissionHandler;
@@ -72,7 +70,6 @@ public final class GenerationPipeline implements ManagedService {
   private final EnumMap<Profile, String> profileGeneralPrompts = new EnumMap<>(Profile.class);
   private volatile String memoryAgentPrompt = DEFAULT_MEMORY_AGENT_PROMPT;
   private volatile boolean memoryAgentEnabled = true;
-  private final FileSearchService fileSearch = new FileSearchService();
   private final FileToolService fileTool = new FileToolService();
   private volatile FilePermissionHandler filePermissionHandler = request -> false;
   private volatile Set<ModelRole> availableAgentRoles = Set.of();
@@ -88,9 +85,8 @@ public final class GenerationPipeline implements ManagedService {
   private String conversationSummary = "";
 
   public void setFileSearchMaxVisited(int value) {
-    fileSearch.setMaxVisited(value);
     fileTool.setSearchMaxVisited(value);
-    System.out.println("[FileSearch] maxVisited configured=" + fileSearch.maxVisited());
+    System.out.println("[FileTool] search maxVisited configured=" + value);
   }
 
   public void setAvailableAgentRoles(Set<ModelRole> roles) {
@@ -163,25 +159,6 @@ MEMORY RECALL TOOL:
 После вызова система пришлёт найденные записи Memory Agent. Проанализируй их вместе с текущим контекстом и затем продолжи/заверши обычный ответ пользователю. Не повторяй уже выведенную до команды часть ответа, не показывай пользователю MEMORY_RECALL и не вызывай его повторно для этого запроса.
 """.trim();
 
-  private static final String FILE_TOOL_SYSTEM_PROMPT = """
-
-FILE TOOL:
-Use File Tool for real filesystem operations. Never invent paths.
-Protocol: [[FILE_TOOL:roots]], [[FILE_TOOL:list|path]], [[FILE_TOOL:search|path|name]], [[FILE_TOOL:grep|path|text]], [[FILE_TOOL:read|path]], [[FILE_TOOL:write|path|content]], [[FILE_TOOL:edit|path|old text|new text]].
-
-Tool selection rules:
-- If filesystem roots are unknown, call roots once.
-- If you need to FIND a file or directory and do not know its exact path, use search. Search is recursive; do not manually walk the directory tree with repeated list calls.
-- Use list only to inspect the immediate contents of one already-known directory. Never use list repeatedly as a substitute for search.
-- Use grep to find text inside a known file or directory tree.
-- Use read only after the exact file path is known and its contents are actually needed.
-- Do not ask the user for a root/path before trying roots/search when the requested target can reasonably be discovered automatically.
-- Do not guess Desktop, Documents, usernames, OneDrive paths, project folders, or file names. Use only paths confirmed by File Tool.
-- If a tool returns no result or an error, change the search query/root/operation instead of inventing a path or repeating the same traversal.
-- Stop using tools as soon as enough information is available and answer the user.
-- roots/list/search/grep execute immediately; read/write/edit require user permission. If permission is denied, stop that filesystem operation.
-""".trim();
-
   public void setPrompts(String personality, String general) {
     setPromptSnapshot(personality, general, memoryAgentPrompt, memoryAgentEnabled);
   }
@@ -231,16 +208,6 @@ Tool selection rules:
     List<String> copy = routes == null ? List.of() : routes.stream()
         .filter(Objects::nonNull).map(String::trim).filter(v -> !v.isBlank()).distinct().toList();
     fileRouteSearchConfigs.put(p, new FileRouteSearchConfig(enabled, copy));
-  }
-
-  private List<FileSearchResult> searchFiles(Profile profile, String query, int limit) {
-    FileRouteSearchConfig cfg;
-    synchronized (this) { cfg = fileRouteSearchConfigs.get(profile == null ? Profile.NORMAL : profile); }
-    if (cfg != null && cfg.enabled() && !cfg.routes().isEmpty()) {
-      System.out.println("[FileSearch] Saved-route storage enabled · routes=" + cfg.routes().size());
-      return fileSearch.searchPrioritized(cfg.routes(), query, limit);
-    }
-    return fileSearch.search(query, limit);
   }
 
   public GenerationPipeline(ConfigLocator configs, ServiceLocator services) {
@@ -460,7 +427,6 @@ Tool selection rules:
           chunk -> { if (activeSpeechQueue != null) activeSpeechQueue.accept(chunk); });
 
       MemoryRecallCall memoryCall = null;
-      FileSearchCall fileCall = null;
       FileToolCall fileToolCall = null;
       AgentCall agentCall = null;
       String assistantTurn;
@@ -489,15 +455,6 @@ Tool selection rules:
         memoryCall = detected.call();
         assistantTurn = filter.agentTextForContinuation()
             + formatCall(profile, ModelRole.MEMORY, memoryCall.query());
-      } catch (FileSearchToolDetected detected) {
-        TtsTrace.log(ttsTraceId, "LLM_TOOL_ROUTE", "tool=FileSearchToolDetected cancelling speculative voice");
-        if (activeSpeechQueue != null) {
-          activeSpeechQueue.cancel();
-          if (activeTtsQueue == activeSpeechQueue) activeTtsQueue = null;
-        }
-        fileCall = detected.call();
-        assistantTurn = filter.agentTextForContinuation()
-            + formatCall(profile, ModelRole.FILE_SEARCH, fileCall.query());
       } catch (FileToolDetected detected) {
         TtsTrace.log(ttsTraceId, "LLM_TOOL_ROUTE", "tool=FileToolDetected cancelling speculative voice");
         if (activeSpeechQueue != null) {
@@ -572,7 +529,7 @@ Tool selection rules:
           continue;
         }
         System.out.println("[DeepAnalysis] FILE_TOOL " + fileToolCall.operation() + " args=" + fileToolCall.args().size());
-        String toolResult = executeFileTool(id, fileToolCall);
+        String toolResult = executeFileTool(id, profile, fileToolCall);
         if ("list".equalsIgnoreCase(fileToolCall.operation())) {
           consecutiveListCalls++;
         } else {
@@ -586,28 +543,6 @@ Tool selection rules:
         working.add(new ConversationTurn("system", toolResult));
         lastToolLabel = "FILE_TOOL: " + fileToolCall.operation();
         lastToolResult = toolResult;
-      } else if (fileCall != null) {
-        String key = "FILE_SEARCH:" + fileCall.query().trim().toLowerCase(Locale.ROOT);
-        if (!executedCalls.add(key)) {
-          System.out.println("[DeepAnalysis] duplicate tool call blocked: " + key);
-          working.add(new ConversationTurn("system",
-              "This exact FILE_SEARCH call was already executed. Do not repeat it. "
-                  + "Reformulate the query, search a different location/term, choose another tool, or finish the answer."));
-          continue;
-        }
-        System.out.println("[DeepAnalysis] FILE_SEARCH: " + fileCall.query());
-        emit(id, PipelineEvent.Type.THINK_START, "File Search");
-        List<FileSearchResult> files;
-        try {
-          files = searchFiles(profile, fileCall.query(), 20);
-          System.out.println("[DeepAnalysis] FILE_SEARCH results=" + files.size());
-          for (FileSearchResult f : files) System.out.println("[FileSearch] " + f.path());
-        } finally {
-          emit(id, PipelineEvent.Type.THINK_END, "File Search finished");
-        }
-        lastToolLabel = "FILE_SEARCH: " + fileCall.query();
-        lastToolResult = buildFileSearchResultDeep(fileCall.query(), files);
-        working.add(new ConversationTurn("system", lastToolResult));
       }
 
     }
@@ -723,21 +658,6 @@ Reply in the user's language.
     return answer;
   }
 
-  private String buildFileSearchResultDeep(String query, List<FileSearchResult> files) {
-    StringBuilder out = new StringBuilder("FILE_SEARCH_RESULT for: ").append(query).append('\n');
-    if (files == null || files.isEmpty()) {
-      out.append("No matching local files or folders were found. Do not invent paths. "
-          + "If the task still requires a file, reason about a better/different FILE_SEARCH query and try again.");
-      return out.toString();
-    }
-    for (FileSearchResult f : files) {
-      out.append("- ").append(f.directory() ? "[DIR] " : "[FILE] ").append(f.path()).append('\n');
-    }
-    out.append("Use only real paths returned above. If these results are insufficient, you may perform another "
-        + "FILE_SEARCH with a different, more specific query.");
-    return out.toString();
-  }
-
   private String buildMemoryRecallResultDeep(String query, List<MemoryRecord> records) {
     StringBuilder out = new StringBuilder("MEMORY_RECALL_RESULT for: ").append(query).append('\n');
     if (records == null || records.isEmpty()) {
@@ -809,10 +729,6 @@ Reply in the user's language.
     if (availableAgentRoles.contains(ModelRole.MEMORY)) {
       stableSystem.append("\n\n[MEMORY SEARCH CALL]\nUse this exact configured syntax when deep memory lookup is needed (it overrides legacy examples elsewhere in the prompt): ")
           .append(agentTemplate(profile, ModelRole.MEMORY));
-    }
-    if (availableAgentRoles.contains(ModelRole.FILE_SEARCH)) {
-      stableSystem.append("\n\n[FILE SEARCH CALL]\nUse this exact configured syntax for semantic/local file-path search (it overrides legacy examples elsewhere in the prompt): ")
-          .append(agentTemplate(profile, ModelRole.FILE_SEARCH));
     }
     if (!availableAgentRoles.isEmpty()) {
       StringBuilder agents = new StringBuilder("\n\n[SUB-AGENTS]\nYou may delegate specialist work to enabled sub-agents. Calls are hidden from the user. Use EXACTLY the configured syntax shown below and replace {task} with a concrete self-contained task:\n");
@@ -1175,8 +1091,8 @@ Reply in the user's language.
           if (call != null) throw new MemoryToolDetected(call, visible.toString(), block);
           FileToolCall fileToolCall = parseFileTool(block);
           if (fileToolCall != null) throw new FileToolDetected(fileToolCall);
-          FileSearchCall fileCall = parseFileSearch(block, profile);
-          if (fileCall != null) throw new FileSearchToolDetected(fileCall);
+          FileToolCall legacyFileSearch = parseLegacyFileSearch(block);
+          if (legacyFileSearch != null) throw new FileToolDetected(legacyFileSearch);
           publish(block);
           continue;
         }
@@ -1194,8 +1110,8 @@ Reply in the user's language.
         if (agentCall != null) throw new AgentToolDetected(agentCall);
         MemoryRecallCall memoryCall = parseMemoryRecall(block, profile);
         if (memoryCall != null) throw new MemoryToolDetected(memoryCall, visible.toString(), block);
-        FileSearchCall fileSearchCall = parseFileSearch(block, profile);
-        if (fileSearchCall != null) throw new FileSearchToolDetected(fileSearchCall);
+        FileToolCall legacyFileSearch = parseLegacyFileSearch(block);
+        if (legacyFileSearch != null) throw new FileToolDetected(legacyFileSearch);
         publish(block);
       }
     }
@@ -1476,12 +1392,17 @@ Reply in the user's language.
     String body = matcher.group(1);
     String[] first = body.split("\\|", 2);
     String operation = first[0].trim().toLowerCase(Locale.ROOT);
-    if (!Set.of("roots", "list", "search", "grep", "read", "write", "edit").contains(operation)) return null;
+    if (!Set.of("roots", "list", "glob", "search", "grep", "read", "write", "edit", "patch").contains(operation)) return null;
     String rest = first.length > 1 ? first[1] : "";
+    if (operation.equals("search")) {
+      // New form is search|name. Keep the former search|root|name GUI prompt compatible.
+      List<String> searchArgs = new ArrayList<>(Arrays.asList(rest.split("\\|", 2)));
+      return new FileToolCall(operation, searchArgs, matcher.group(0));
+    }
     int expected = switch (operation) {
       case "roots" -> 0;
-      case "grep", "write", "search" -> 2;
-      case "edit" -> 3;
+      case "glob", "grep", "write" -> 2;
+      case "read", "edit", "patch" -> 3;
       default -> 1;
     };
     List<String> args = new ArrayList<>();
@@ -1492,9 +1413,16 @@ Reply in the user's language.
     return new FileToolCall(operation, args, matcher.group(0));
   }
 
-  private String executeFileTool(long id, FileToolCall call) throws Exception {
+  private String executeFileTool(long id, Profile profile, FileToolCall call) throws Exception {
     String op = call.operation();
-    boolean needsPermission = op.equals("read") || op.equals("write") || op.equals("edit");
+    FileRouteSearchConfig routeConfig;
+    synchronized (this) {
+      routeConfig = fileRouteSearchConfigs.get(profile == null ? Profile.NORMAL : profile);
+    }
+    fileTool.setPreferredRoots(routeConfig != null && routeConfig.enabled()
+        ? routeConfig.routes() : List.of());
+    boolean needsPermission = op.equals("grep") || op.equals("read") || op.equals("write")
+        || op.equals("edit") || op.equals("patch");
     List<String> resolvedArgs = new ArrayList<>(call.args());
     if (!resolvedArgs.isEmpty() && !op.equals("roots")) {
       // Paths returned by roots/list/search are already concrete. resolvePath still handles
@@ -1504,16 +1432,21 @@ Reply in the user's language.
     if (needsPermission) {
       String path = resolvedArgs.isEmpty() ? "" : resolvedArgs.get(0).trim();
       String details = switch (op) {
-        case "read" -> "Nina хочет прочитать содержимое файла.";
+        case "read" -> "Nina хочет прочитать содержимое файла.\n\nСтрока начала: "
+            + (resolvedArgs.size() > 1 && !resolvedArgs.get(1).isBlank() ? resolvedArgs.get(1) : "1")
+            + "\nМаксимум строк: "
+            + (resolvedArgs.size() > 2 && !resolvedArgs.get(2).isBlank() ? resolvedArgs.get(2) : "400");
+        case "grep" -> "Nina хочет выполнить поиск по содержимому файлов.\n\nРегулярное выражение:\n"
+            + (resolvedArgs.size() > 1 ? resolvedArgs.get(1) : "");
         case "write" -> {
           String content = resolvedArgs.size() > 1 ? resolvedArgs.get(1) : "";
-          yield "Nina хочет создать или перезаписать файл.\n\nСодержимое файла:\n" + content;
+          yield writePreview(path, content);
         }
-        case "edit" -> {
+        case "edit", "patch" -> {
           String oldText = resolvedArgs.size() > 1 ? resolvedArgs.get(1) : "";
           String newText = resolvedArgs.size() > 2 ? resolvedArgs.get(2) : "";
-          yield "Nina хочет изменить существующий файл.\n\nБудет заменено:\n--- OLD ---\n" + oldText
-              + "\n--- NEW ---\n" + newText;
+          yield "Nina хочет изменить существующий файл.\n\n--- OLD ---\n" + preview(oldText)
+              + "\n--- NEW ---\n" + preview(newText);
         }
         default -> "";
       };
@@ -1536,6 +1469,24 @@ Reply in the user's language.
     }
   }
 
+  private static String writePreview(String path, String proposed) {
+    String old = "[новый файл]";
+    try {
+      java.nio.file.Path file = java.nio.file.Path.of(path);
+      if (java.nio.file.Files.isRegularFile(file)) {
+        old = java.nio.file.Files.readString(file, java.nio.charset.StandardCharsets.UTF_8);
+      }
+    } catch (Exception ignored) {}
+    return "Nina хочет создать или перезаписать файл.\n\n--- CURRENT ---\n" + preview(old)
+        + "\n--- PROPOSED ---\n" + preview(proposed);
+  }
+
+  private static String preview(String value) {
+    String text = value == null ? "" : value;
+    int max = 30_000;
+    return text.length() <= max ? text : text.substring(0, max) + "\n[PREVIEW TRUNCATED]";
+  }
+
   private record FileToolCall(String operation, List<String> args, String raw) {}
   private final class FileToolDetected extends RuntimeException {
     private final FileToolCall call;
@@ -1543,34 +1494,14 @@ Reply in the user's language.
     private FileToolCall call() { return call; }
   }
 
-  private static final java.util.regex.Pattern FILE_SEARCH_PATTERN =
-      java.util.regex.Pattern.compile("\\[\\[FILE_SEARCH\\s*:\\s*(.+?)\\]\\]",
-          java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
-
-  private FileSearchCall parseFileSearch(String text, Profile profile) {
-    String query = parseConfiguredTask(text, profile, ModelRole.FILE_SEARCH);
-    return query == null || query.isBlank() ? null : new FileSearchCall(query);
-  }
-
-  private String buildFileSearchResult(String query, List<FileSearchResult> files) {
-    StringBuilder out = new StringBuilder("FILE_SEARCH_RESULT for: ").append(query).append('\n');
-    if (files == null || files.isEmpty()) {
-      return out.append("No matching local files or folders were found. Do not invent paths.").toString();
-    }
-    for (FileSearchResult f : files) {
-      out.append("- ").append(f.directory() ? "[DIR] " : "[FILE] ")
-          .append(f.path()).append('\n');
-    }
-    out.append("Use only paths returned above. Do not invoke FILE_SEARCH again for this request.");
-    return out.toString();
-  }
-
-  private record FileSearchCall(String query) {}
-
-  private final class FileSearchToolDetected extends RuntimeException {
-    private final FileSearchCall call;
-    private FileSearchToolDetected(FileSearchCall call) { super("FILE_SEARCH"); this.call = call; }
-    private FileSearchCall call() { return call; }
+  /** Compatibility for saved GUI prompts from before deterministic File Tools. */
+  private FileToolCall parseLegacyFileSearch(String text) {
+    if (text == null || text.isBlank()) return null;
+    java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(
+        "\\[\\[(?:AGENT:)?FILE_SEARCH\\s*[:|]\\s*(.+?)\\]\\]",
+        java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL).matcher(text);
+    if (!matcher.find() || matcher.group(1).isBlank()) return null;
+    return new FileToolCall("search", List.of(matcher.group(1).trim()), matcher.group(0));
   }
 
   private String buildMemoryRecallResult(String query, List<MemoryRecord> records) {

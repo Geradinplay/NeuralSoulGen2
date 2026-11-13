@@ -102,6 +102,12 @@ public final class SettingsStore {
     } catch (IllegalArgumentException e) {
       s.voiceInputMode.set(VoiceInputMode.INTERRUPT);
     }
+    try {
+      s.fileToolApprovalMode.set(FileToolApprovalMode.valueOf(
+          get("files.approvalMode", FileToolApprovalMode.MANUAL.name())));
+    } catch (IllegalArgumentException e) {
+      s.fileToolApprovalMode.set(FileToolApprovalMode.MANUAL);
+    }
     s.mode.set(get("mode", "Обычный"));
     String savedProfile = get("activeProfile", "NORMAL");
     try { s.activeProfile.set(Profile.valueOf(savedProfile)); } catch (IllegalArgumentException e) { s.activeProfile.set(Profile.NORMAL); }
@@ -245,6 +251,8 @@ public final class SettingsStore {
     put("voice", s.voice.get());
     put("voice.alwaysListen", s.alwaysListen.get());
     put("voice.inputMode", s.voiceInputMode.get() == null ? VoiceInputMode.INTERRUPT.name() : s.voiceInputMode.get().name());
+    put("files.approvalMode", s.fileToolApprovalMode.get() == null
+        ? FileToolApprovalMode.MANUAL.name() : s.fileToolApprovalMode.get().name());
     put("mode", s.mode.get());
     put("activeProfile", s.activeProfile.get().name());
     put("prompt.personality", s.personalityPrompt(Profile.NORMAL).get());
@@ -358,7 +366,7 @@ public final class SettingsStore {
       try {
         ModelRole role = ModelRole.valueOf(normalizedRole);
         if (m.memoryOnly) {
-          if (role == ModelRole.MEMORY || role == ModelRole.FILE_SEARCH) roles.add(role);
+          if (role == ModelRole.MEMORY) roles.add(role);
         } else if (m.webSearchOnly) {
           if (role == ModelRole.WEB_SEARCH) roles.add(role);
         } else if (role != ModelRole.MEMORY && role != ModelRole.FILE_SEARCH

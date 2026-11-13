@@ -5,7 +5,7 @@ import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
 
-/** Bounded, read-only local filename/path search used by FILE_SEARCH. */
+/** Bounded, read-only filename/path index used by deterministic File Tools. */
 public final class FileSearchService {
   private static final int DEFAULT_MAX_VISITED = 120_000;
   private volatile int maxVisited = DEFAULT_MAX_VISITED;

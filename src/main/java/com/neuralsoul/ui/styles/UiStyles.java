@@ -33,6 +33,11 @@ public final class UiStyles {
   public static void userBubble(Region node) { node.setStyle("-fx-background-color:rgba(74,57,132,0.72);-fx-background-radius:16;-fx-border-color:rgba(139,112,235,0.45);-fx-border-radius:16;"); }
   public static void heading(Label node, boolean thinking) { node.setStyle("-fx-text-fill:#f4f4f4;-fx-font-size:15px;-fx-font-weight:bold;-fx-padding:3 0 1 0;"+(thinking?"-fx-opacity:0.78;-fx-font-style:italic;":"")); }
   public static void chatText(TextArea node, boolean thinking) { node.setStyle("-fx-background-color:transparent;-fx-background-insets:0;-fx-padding:0;-fx-border-color:transparent;-fx-control-inner-background:transparent;-fx-text-fill:#f4f4f4;-fx-prompt-text-fill:#f4f4f4;-fx-highlight-fill:#6650a4;-fx-highlight-text-fill:#ffffff;"+(thinking?"-fx-opacity:0.78;-fx-font-style:italic;":"")); }
+  public static void chatInline(Text node, boolean thinking, boolean bold) {
+    node.setStyle("-fx-fill:#f4f4f4;-fx-font-size:13px;"
+        + (bold ? "-fx-font-weight:bold;" : "")
+        + (thinking ? "-fx-opacity:0.78;-fx-font-style:italic;" : ""));
+  }
   public static void codeFlow(Node node) { node.setStyle("-fx-padding:10 12 10 12;-fx-background-color:rgba(10,12,18,0.96);"); }
   public static void codeScroll(ScrollPane node) { node.setStyle("-fx-background:rgba(10,12,18,0.96);-fx-background-color:rgba(10,12,18,0.96);-fx-border-color:rgba(130,140,170,0.35);-fx-border-radius:8;-fx-background-radius:8;"); }
   public static void codeBox(Region node) { node.setStyle("-fx-background-color:rgba(12,14,20,0.72);-fx-background-radius:10;-fx-border-color:rgba(130,140,170,0.22);-fx-border-radius:10;"); }

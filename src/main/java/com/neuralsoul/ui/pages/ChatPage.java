@@ -17,6 +17,7 @@ import javafx.scene.text.TextFlow;
 
 public final class ChatPage extends BorderPane {
   private static final Pattern MARKDOWN_H3 = Pattern.compile("(?m)^\\s*###\\s+(.+?)\\s*$");
+  private static final Pattern MARKDOWN_BOLD = Pattern.compile("\\*\\*([^\\r\\n*](?:[^\\r\\n]*?[^\\r\\n*])?)\\*\\*");
   private static final Pattern CODE_BLOCK = Pattern.compile(
       "(?s)```\\s*([\\w.+#-]*)\\s*\\n?(.*?)```|<code(?:\\s+(?:lang|language)=\\\"?([\\w.+#-]+)\\\"?)?>(.*?)</code>",
       Pattern.CASE_INSENSITIVE);
@@ -143,13 +144,13 @@ public final class ChatPage extends BorderPane {
   /** Renders Markdown level-3 headings as a slightly larger bold line. */
   private static Node markdownText(String text, boolean thinking) {
     Matcher matcher = MARKDOWN_H3.matcher(text == null ? "" : text);
-    if (!matcher.find()) return selectableText(text, thinking);
+    if (!matcher.find()) return inlineMarkdown(text, thinking);
     VBox box = new VBox(3);
     int from = 0;
     do {
       if (matcher.start() > from) {
         String before = text.substring(from, matcher.start()).replaceFirst("\\s+$", "");
-        if (!before.isBlank()) box.getChildren().add(selectableText(before, thinking));
+        if (!before.isBlank()) box.getChildren().add(inlineMarkdown(before, thinking));
       }
       Label heading = new Label(matcher.group(1).trim());
       heading.setWrapText(true);
@@ -160,10 +161,44 @@ public final class ChatPage extends BorderPane {
     } while (matcher.find());
     if (from < text.length()) {
       String tail = text.substring(from).replaceFirst("^\\s+", "");
-      if (!tail.isBlank()) box.getChildren().add(selectableText(tail, thinking));
+      if (!tail.isBlank()) box.getChildren().add(inlineMarkdown(tail, thinking));
     }
     box.setFillWidth(true);
     return box;
+  }
+
+  /** Renders **text** as bold while leaving unmatched asterisks unchanged. */
+  private static Node inlineMarkdown(String value, boolean thinking) {
+    String text = value == null ? "" : value;
+    Matcher matcher = MARKDOWN_BOLD.matcher(text);
+    if (!matcher.find()) return selectableText(text, thinking);
+
+    TextFlow flow = new TextFlow();
+    flow.setMaxWidth(Double.MAX_VALUE);
+    int from = 0;
+    do {
+      if (matcher.start() > from) addInlineText(flow, text.substring(from, matcher.start()), thinking, false);
+      addInlineText(flow, matcher.group(1), thinking, true);
+      from = matcher.end();
+    } while (matcher.find());
+    if (from < text.length()) addInlineText(flow, text.substring(from), thinking, false);
+
+    MenuItem copy = new MenuItem("Копировать текст");
+    copy.setOnAction(event -> {
+      ClipboardContent content = new ClipboardContent();
+      content.putString(text);
+      Clipboard.getSystemClipboard().setContent(content);
+    });
+    ContextMenu menu = new ContextMenu(copy);
+    flow.setOnContextMenuRequested(event -> menu.show(flow, event.getScreenX(), event.getScreenY()));
+    return flow;
+  }
+
+  private static void addInlineText(TextFlow flow, String value, boolean thinking, boolean bold) {
+    if (value == null || value.isEmpty()) return;
+    Text node = new Text(value);
+    UiStyles.chatInline(node, thinking, bold);
+    flow.getChildren().add(node);
   }
 
   private static TextArea selectableText(String text, boolean thinking) {

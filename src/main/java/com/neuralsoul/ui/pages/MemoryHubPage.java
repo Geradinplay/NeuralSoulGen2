@@ -68,9 +68,6 @@ public final class MemoryHubPage extends VBox {
   private void show(Section section) {
     current = section;
     Node page = pages.computeIfAbsent(section, this::createPage);
-    if (section == Section.FILES && page instanceof WorkspacePage filePage) {
-      filePage.refreshFileModels();
-    }
     pageHost.getChildren().setAll(page);
     ToggleButton active = tabs.get(section);
     if (!active.isSelected()) active.setSelected(true);

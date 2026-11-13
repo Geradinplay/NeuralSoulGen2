@@ -34,7 +34,7 @@ public final class AgentsPage extends VBox {
    if (selected != null) editor.textProperty().bindBidirectional(selected.prompt());
   });
   roles.getSelectionModel().selectFirst();
-  Label tools = new Label("Web Search LLM формирует поисковые запросы; SEARCH/FETCH исполняет контроллер, а выбранная Reasoning-модель решает: ANSWER, FETCH или новый SEARCH. Каждая General-модель имеет собственный промпт. Чтобы добавить её сюда, назначьте роль General во вкладке «Модели» и заново откройте «Агенты». File Search / File Tool теперь имеет редактируемый системный промпт в этом списке. Memory Search пока выполняет поиск без отдельного LLM-промпта.");
+  Label tools = new Label("Web Search LLM формирует интернет-запросы. File Tools — встроенные Java-инструменты glob/grep/read/edit/patch, отдельная модель для них не нужна. Основная или Coding-модель выбирает операцию, а режим подтверждения задаётся на странице файлов. Каждая General-модель имеет собственный промпт.");
   tools.setWrapText(true);
   Button saveButton = new Button("Сохранить"); saveButton.setOnAction(e -> save.run());
   saveButton.disableProperty().bind(state.systemRunning.or(state.systemStarting));

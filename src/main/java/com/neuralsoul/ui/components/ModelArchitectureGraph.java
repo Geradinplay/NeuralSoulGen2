@@ -95,7 +95,7 @@ public final class ModelArchitectureGraph extends BorderPane {
 
       for (ModelRole role : cfg.roles()) {
         if (role == ModelRole.MAIN_LLM) continue;
-        if (role == ModelRole.MEMORY || role == ModelRole.FILE_SEARCH) {
+        if (role == ModelRole.MEMORY) {
           nodes.add(GraphNode.service(model, role, cfg));
         } else {
           nodes.add(GraphNode.agent(model, role, cfg));

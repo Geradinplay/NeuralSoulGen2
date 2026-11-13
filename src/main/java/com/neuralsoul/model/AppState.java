@@ -65,6 +65,9 @@ public final class AppState {
   /** How continuous voice behaves when a response is already being generated. */
   public final ObjectProperty<VoiceInputMode> voiceInputMode =
       new SimpleObjectProperty<>(VoiceInputMode.INTERRUPT);
+  /** Approval policy for built-in deterministic filesystem tools. */
+  public final ObjectProperty<FileToolApprovalMode> fileToolApprovalMode =
+      new SimpleObjectProperty<>(FileToolApprovalMode.MANUAL);
   /** Number of recognized voice phrases waiting for the current response to finish. */
   public final IntegerProperty voiceBufferSize = new SimpleIntegerProperty(0);
 
@@ -395,36 +398,6 @@ public final class AppState {
     }
 
     if (target == activeProfile.get()) applyProfile(target);
-  }
-
-
-  /** True when at least one enabled FILE_SEARCH model for the profile uses saved file routes. */
-  public boolean useSavedFileRoutes(Profile p) {
-    if (p == null) p = Profile.NORMAL;
-    if (p == activeProfile.get()) snapshotActiveProfile(p);
-    ProfileState profile = profile(p);
-    for (ModelAssignment model : models) {
-      ModelAssignment.ProfileConfig cfg = profile.model(model.fileName);
-      if (cfg == null) cfg = profile(Profile.NORMAL).model(model.fileName);
-      if (cfg == null) cfg = model.snapshotProfile();
-      if (cfg.enabled() && cfg.roles().contains(ModelRole.FILE_SEARCH)
-          && profile.fileRouteStorageEnabled(model.fileName)) return true;
-    }
-    return false;
-  }
-
-  /** Models that actually expose FILE_SEARCH in the selected profile. */
-  public List<ModelAssignment> fileSearchModels(Profile p) {
-    if (p == null) p = Profile.NORMAL;
-    if (p == activeProfile.get()) snapshotActiveProfile(p);
-    ProfileState profile = profile(p);
-    List<ModelAssignment> result = new ArrayList<>();
-    for (ModelAssignment model : models) {
-      ModelAssignment.ProfileConfig cfg = profile.model(model.fileName);
-      if (cfg == null) cfg = profile(Profile.NORMAL).model(model.fileName);
-      if (cfg != null && cfg.roles().contains(ModelRole.FILE_SEARCH)) result.add(model);
-    }
-    return result;
   }
 
   private String effectivePrompt(String base) {

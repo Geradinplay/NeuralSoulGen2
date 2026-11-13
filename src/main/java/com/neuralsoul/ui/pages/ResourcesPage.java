@@ -153,20 +153,17 @@ public final class ResourcesPage extends VBox {
     Runnable update = () -> {
       Profile profile = state.activeProfile.get() == null ? Profile.NORMAL : state.activeProfile.get();
       String memory = state.agentCallTemplate(profile, ModelRole.MEMORY).get();
-      String files = state.agentCallTemplate(profile, ModelRole.FILE_SEARCH).get();
       if (memory == null || !memory.contains("{task}"))
         memory = ProfileState.defaultAgentCallTemplate(ModelRole.MEMORY);
-      if (files == null || !files.contains("{task}"))
-        files = ProfileState.defaultAgentCallTemplate(ModelRole.FILE_SEARCH);
       example.setText("Примеры служебных вызовов для Main LLM:\n"
           + "Memory Search: " + memory.replace("{task}", "Что мы обсуждали про Qdrant?") + "\n"
-          + "File Search: " + files.replace("{task}", "Найди Java-класс распределения моделей") + "\n"
+          + "File Tools: [[FILE_TOOL:search|ModelAssignment.java]]\n"
           + "Команды выполняет пайплайн, пользователю они не показываются. "
           + "Шаблоны можно настроить в профиле.");
     };
     update.run();
     state.activeProfile.addListener((obs, oldProfile, newProfile) -> update.run());
-    return Ui.card("Как вызвать Memory Search / File Search", example);
+    return Ui.card("Как вызвать Memory Search / File Tools", example);
   }
 
   private Node profileSelector() {
@@ -322,7 +319,6 @@ public final class ResourcesPage extends VBox {
         Button add = Ui.button("Подключить", "file", () -> {
           if (memorySearch) {
             model.setRole(ModelRole.MEMORY, true);
-            model.setRole(ModelRole.FILE_SEARCH, true);
           } else {
             // Only one Web Search GGUF may be enabled per profile/runtime.
             for (ModelAssignment other : state.models) {
@@ -475,10 +471,9 @@ public final class ResourcesPage extends VBox {
       webReasoningBox.setManaged(webRoleInitiallyEnabled);
     }
 
-    VBox fileSearchLimitBox = memorySearch ? fileSearchLimit(model) : null;
-
     for (ModelRole role : ModelRole.values()) {
-      boolean memoryRole = role == ModelRole.MEMORY || role == ModelRole.FILE_SEARCH;
+      if (role == ModelRole.FILE_SEARCH) continue; // Built-in Java tools; no model assignment.
+      boolean memoryRole = role == ModelRole.MEMORY;
       if (memorySearch && !memoryRole) continue;
       if (webSearch && role != ModelRole.WEB_SEARCH) continue;
       if (!searchPage() && (memoryRole || role == ModelRole.WEB_SEARCH)) continue;
@@ -522,10 +517,6 @@ public final class ResourcesPage extends VBox {
           webReasoningBox.setVisible(enabled);
           webReasoningBox.setManaged(enabled);
         }
-        if (role == ModelRole.FILE_SEARCH && fileSearchLimitBox != null) {
-          fileSearchLimitBox.setVisible(enabled);
-          fileSearchLimitBox.setManaged(enabled);
-        }
         commitAndPersist();
         if (role == ModelRole.REASONING || role == ModelRole.WEB_SEARCH) {
           refreshReasoningSelectors();
@@ -536,7 +527,6 @@ public final class ResourcesPage extends VBox {
     }
     roleBox.getChildren().add(roles);
     if (webReasoningBox != null) roleBox.getChildren().add(webReasoningBox);
-    if (memorySearch) roleBox.getChildren().add(fileSearchLimitBox);
 
     // Advanced llama.cpp settings and model roles take a lot of vertical space.
     // Keep them collapsed by default and reveal them only when the user asks for them.
@@ -563,22 +553,6 @@ public final class ResourcesPage extends VBox {
     VBox card = new VBox(6, top, details, advancedToggle, advancedContent);
     card.getStyleClass().add("model-row");
     return card;
-  }
-
-  private VBox fileSearchLimit(ModelAssignment model) {
-    Spinner<Integer> limit = intSpinner(
-        model.fileSearchMaxVisited, 1_000, 5_000_000, 10_000, this::commitAndPersist);
-    limit.setPrefWidth(150);
-    limit.setTooltip(new Tooltip(
-        "Максимальное число файлов и папок, проверяемых за один локальный поиск. "
-            + "Большой лимит замедляет обход крупных деревьев."));
-    VBox container = new VBox(4,
-        Ui.label("Лимит обхода File Search", "tiny"),
-        new HBox(10, Ui.label("Макс. объектов за поиск:", "tiny"), limit));
-    boolean enabled = model.roles.contains(ModelRole.FILE_SEARCH);
-    container.setVisible(enabled);
-    container.setManaged(enabled);
-    return container;
   }
 
   private VBox webReasoningSelector(ModelAssignment webModel) {

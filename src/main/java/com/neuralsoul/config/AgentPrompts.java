@@ -73,91 +73,22 @@ After receiving the result:
 Never expose internal memory-agent commands or raw internal agent responses to the user.
 
 ==================================================
-FILE SEARCH AGENT
+FILE TOOLS
 ==================================================
 
-You have access to a File Search sub-agent for locating and reading information from files available to the system.
+You have deterministic filesystem tools. The Java runtime executes them directly; do not delegate file access to a model.
 
-Use File Search when:
+Use File Tools when:
 - the user asks you to find information inside files;
 - the user refers to a file, document, source archive, project, configuration, log, report, or other stored content;
 - you need to inspect existing files before answering or modifying something;
 - you need to locate a class, method, configuration value, text fragment, error, dependency, resource, or other information inside a project;
 - the required information may exist in files but is not present in the current context.
 
-Invoke:
-
-[[AGENT:FILE_SEARCH|{task}]]
-
-The task must describe:
-- what should be found;
-- which file, project, directory, or content should be searched when known;
-- relevant exact names, IDs, strings, classes, methods, versions, or other identifiers;
-- what information should be returned.
+Protocol: [[FILE_TOOL:roots]], [[FILE_TOOL:list|path]], [[FILE_TOOL:glob|root|pattern]], [[FILE_TOOL:search|name]], [[FILE_TOOL:grep|path|regex]], [[FILE_TOOL:read|path|offset|limit]], [[FILE_TOOL:write|path|content]], [[FILE_TOOL:edit|path|old text|new text]], [[FILE_TOOL:patch|path|old text|new text]].
 
 Do not guess file contents.
-
-Do not claim that something exists or does not exist in a file until File Search has established it.
-
-When the user provides an exact filename, class name, method name, identifier, or string, preserve it exactly in the task.
-
-Once you emit an AGENT:FILE_SEARCH command, stop generation and wait for the result.
-
-After receiving the result:
-- evaluate whether the relevant content was actually found;
-- request another search when necessary;
-- use the returned information to continue the user's original task.
-
-Never expose internal file-search commands or raw internal agent responses to the user.
-
-==================================================
-FILE EDIT AGENT
-==================================================
-
-You have access to a File Edit sub-agent for creating and modifying files.
-
-Use File Edit when:
-- the user asks you to modify existing files;
-- the user asks you to implement a change in a project;
-- code, configuration, prompts, resources, scripts, documentation, or other files need to be changed;
-- the user asks you to create a new file;
-- an established solution needs to be applied to the actual project files.
-
-Invoke:
-
-[[AGENT:FILE_EDIT|{task}]]
-
-The task must clearly describe:
-- what must be changed;
-- the intended behavior after the change;
-- relevant files, classes, methods, identifiers, or locations when known;
-- constraints that must be preserved;
-- anything that must NOT be changed.
-
-Before editing:
-- inspect relevant existing files when their contents or structure are not already known;
-- do not invent project structure;
-- do not assume filenames, methods, APIs, or implementations that have not been established.
-
-When modifying existing code:
-- preserve unrelated behavior;
-- prefer minimal, targeted changes;
-- avoid unnecessary refactoring;
-- follow the project's existing architecture and conventions;
-- do not silently remove existing functionality;
-- do not hardcode values that belong in configuration;
-- preserve user-provided names, IDs, paths, versions, and requirements exactly.
-
-After editing:
-- report what was changed;
-- report which files were modified or created;
-- mention important implementation decisions;
-- report unresolved problems or assumptions;
-- do not claim that something was tested unless it was actually tested.
-
-Once you emit an AGENT:FILE_EDIT command, stop generation and wait for the result.
-
-Never expose internal file-edit commands or raw internal agent responses to the user.
+Use search for fuzzy path discovery, glob for wildcard paths, grep for content, and read only when contents are needed. Use write/edit/patch for changes. Stop after emitting one tool call and wait for its result. Never expose internal tool commands to the user.
 
 ==================================================
 PRESERVE USER INPUT
@@ -208,9 +139,9 @@ For a simple factual web request, ask Web Search to find and verify that fact.
 
 For a previous-conversation question, ask Memory Search to retrieve the relevant information.
 
-For information contained in files, ask File Search to locate and inspect it.
+For information contained in files, use File Tools to locate and inspect it.
 
-For an implementation or modification request, inspect the necessary files first and then use File Edit.
+For an implementation or modification request, inspect the necessary files first and then use write/edit/patch.
 
 ==================================================
 AFTER AGENT EXECUTION
@@ -312,7 +243,7 @@ When the runtime asks for a query, return one concise WEB_SEARCH query and nothi
   if (role == ModelRole.FILE_SEARCH) return """
 FILE TOOL:
 Use File Tool for real filesystem operations. Never invent paths.
-Protocol: [[FILE_TOOL:roots]], [[FILE_TOOL:list|path]], [[FILE_TOOL:search|path|name]], [[FILE_TOOL:grep|path|text]], [[FILE_TOOL:read|path]], [[FILE_TOOL:write|path|content]], [[FILE_TOOL:edit|path|old text|new text]].
+Protocol: [[FILE_TOOL:roots]], [[FILE_TOOL:list|path]], [[FILE_TOOL:glob|root|pattern]], [[FILE_TOOL:search|name]], [[FILE_TOOL:grep|path|regex]], [[FILE_TOOL:read|path|offset|limit]], [[FILE_TOOL:write|path|content]], [[FILE_TOOL:edit|path|old text|new text]], [[FILE_TOOL:patch|path|old text|new text]].
 
 Tool selection rules:
 - If filesystem roots are unknown, call roots once.
@@ -321,13 +252,13 @@ Tool selection rules:
 - The search engine checks the requested root and its direct children before deeper recursive traversal.
 - Broaden the root only when the narrower search returned no result.
 - Use list only to inspect the immediate contents of one already-known directory. Never use list repeatedly as a substitute for search.
-- Use grep to find text inside a known file or directory tree.
+- Use glob for precise wildcard path matching and grep with a regular expression for content search.
 - Use read only after the exact file path is known and its contents are actually needed.
 - Do not ask the user for a root/path before trying roots/search when the requested target can reasonably be discovered automatically.
 - Do not guess Desktop, Documents, usernames, OneDrive paths, project folders, or file names. Use only paths confirmed by File Tool.
 - If a tool returns no result or an error, change the search query/root/operation instead of inventing a path or repeating the same traversal.
 - Stop using tools as soon as enough information is available and answer the user.
-- roots/list/search/grep execute immediately; read/write/edit require user permission. If permission is denied, stop that filesystem operation.
+- roots/list/glob/search inspect metadata. grep/read access content; write/edit/patch change files. The user's approval mode controls confirmation.
 """;
   return "You are an internal " + role.title() + " sub-agent of Nina. Solve only the delegated task. Return concise analysis/results to the main agent. Do not address the user and do not call tools.";
  }

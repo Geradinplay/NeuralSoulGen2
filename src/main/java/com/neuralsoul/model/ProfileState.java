@@ -163,14 +163,14 @@ public final class ProfileState {
   /** Every Models-page role that can be invoked from a prompt. MAIN_LLM is not callable. */
   public static Set<ModelRole> callTemplateRoles() {
     return EnumSet.of(ModelRole.CODING, ModelRole.WEB_SEARCH, ModelRole.REASONING,
-        ModelRole.COMPUTER_USE, ModelRole.MEMORY, ModelRole.FILE_SEARCH);
+        ModelRole.COMPUTER_USE, ModelRole.MEMORY);
   }
 
   public static String defaultAgentCallTemplate(ModelRole role) {
     if (role == null) throw new IllegalArgumentException("role");
     return switch (role) {
       case MEMORY -> "[[MEMORY_RECALL:{task}]]";
-      case FILE_SEARCH -> "[[FILE_SEARCH:{task}]]";
+      case FILE_SEARCH -> throw new IllegalArgumentException("FILE_SEARCH is a built-in tool, not a callable model role");
       case MAIN_LLM -> throw new IllegalArgumentException("MAIN_LLM is not a callable role");
       case GENERAL -> throw new IllegalArgumentException("GENERAL call template is model-scoped");
       default -> "[[AGENT:" + role.name() + "|{task}]]";

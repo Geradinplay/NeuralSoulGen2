@@ -17,11 +17,6 @@ import javafx.scene.layout.*;
 
 public final class WorkspacePage extends VBox {
   private static final int INTERNET_PAGE_SIZE = 10;
-  private Runnable refreshFileModels = () -> {};
-
-  /** Refresh role-dependent file search cards when returning from Memory Search. */
-  public void refreshFileModels() { refreshFileModels.run(); }
-
   public WorkspacePage(
       String section, AppState state, Runnable attach, Runnable task, Runnable project, Runnable persist) {
     this(section, state, attach, task, project, persist, state.webSearches::clear);
@@ -319,34 +314,11 @@ public final class WorkspacePage extends VBox {
             Ui.button("Добавить файл", "attach", attach),
             Ui.button("Открыть проект", "folder", project)));
 
-    VBox modelRows = new VBox(10);
-    Runnable refreshModels = () -> {
-      modelRows.getChildren().clear();
-      Profile profile = state.activeProfile.get() == null ? Profile.NORMAL : state.activeProfile.get();
-      var models = state.fileSearchModels(profile);
-      if (models.isEmpty()) {
-        modelRows.getChildren().add(notice("В этом профиле нет моделей с ролью File Search. Настрой их в «Память → Поиск в памяти»."));
-        return;
-      }
-      for (ModelAssignment model : models) {
-        var cfg = state.modelProfileConfig(profile, model);
-        Label name = Ui.label(model.name, "body");
-        Label meta = Ui.label(model.fileName + " · " + (cfg.enabled() ? "включена" : "выключена"), "tiny");
-        VBox text = new VBox(2, name, meta);
-        HBox.setHgrow(text, Priority.ALWAYS);
-        ToggleButton toggle = Ui.toggle(state.profile(profile).fileRouteStorage(model.fileName));
-        toggle.setOnAction(e -> { if (persist != null) persist.run(); });
-        Label toggleTitle = Ui.label("Хранилище маршрута файлов", "body");
-        Label hint = Ui.label("Сначала искать по сохранённым путям, затем по файловой системе ПК", "tiny");
-        VBox option = new VBox(2, Ui.row(toggleTitle, toggle), hint);
-        option.setMinWidth(390);
-        modelRows.getChildren().add(Ui.card("", Ui.row(Icons.of("file"), text, option)));
-      }
-    };
-    this.refreshFileModels = refreshModels;
-    refreshModels.run();
-    state.activeProfile.addListener((obs, oldProfile, newProfile) -> refreshModels.run());
-    state.models.addListener((javafx.collections.ListChangeListener<ModelAssignment>) c -> refreshModels.run());
+    ComboBox<FileToolApprovalMode> approval = new ComboBox<>();
+    approval.getItems().setAll(FileToolApprovalMode.values());
+    approval.valueProperty().bindBidirectional(state.fileToolApprovalMode);
+    approval.setMaxWidth(Double.MAX_VALUE);
+    approval.setOnAction(e -> { if (persist != null) persist.run(); });
 
     Label profileLabel = Ui.label("", "muted");
     profileLabel.textProperty().bind(javafx.beans.binding.Bindings.createStringBinding(
@@ -355,14 +327,16 @@ public final class WorkspacePage extends VBox {
 
     getChildren().add(
         Ui.card(
-            "File Search",
+            "Файловые инструменты",
             profileLabel,
-            notice("Переключатель показывается для моделей с ролью File Search. Роли настраиваются в «Память → Поиск в памяти»."),
-            modelRows));
+            notice("Встроенные инструменты glob/grep/read/edit/patch работают напрямую с файловой системой. Отдельная File Search-модель не требуется."),
+            Ui.label("Подтверждение доступа", "body"),
+            approval,
+            Ui.label("В ручном режиме чтение содержимого и любые изменения показываются до выполнения. Поиск путей и просмотр списка каталогов остаются безопасными операциями.", "tiny")));
 
     getChildren().add(Ui.label("Сохранённые пути", "section-title"));
     getChildren().add(notice(
-        "Добавленные файлы и проекты принадлежат текущему профилю и используются как приоритетные маршруты поиска, если для File Search-модели включено «Хранилище маршрута файлов»."));
+        "Добавленные файлы и проекты принадлежат текущему профилю и всегда используются как приоритетные корни встроенного поиска."));
 
     VBox routesHost = new VBox();
     Runnable refreshRoutes = () -> {

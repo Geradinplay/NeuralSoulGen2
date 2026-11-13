@@ -7,7 +7,7 @@ public enum ModelRole {
   REASONING("Reasoning", "Планирование и сложные рассуждения"),
   COMPUTER_USE("Computer Use", "Мышь, клавиатура и управление приложениями"),
   MEMORY("Memory Search", "Семантический поиск по долговременной памяти"),
-  FILE_SEARCH("File Search", "Семантический поиск файлов и их содержимого на локальном ПК через BGE-M3"),
+  FILE_SEARCH("Файловые инструменты", "Встроенные glob/grep/read/edit/patch без отдельной поисковой модели"),
   GENERAL("General", "Универсальный вспомогательный субагент");
 
   private final String title;

@@ -239,7 +239,7 @@ public final class AppController implements AutoCloseable {
                       case THINK_START -> {
                         memoryAgentActive = true;
                         memoryAgentVisibleSinceNanos = System.nanoTime();
-                        if ("File Search".equalsIgnoreCase(event.text()))
+                        if (event.text() != null && event.text().regionMatches(true, 0, "File ", 0, 5))
                           state.activeAgent.set(AgentType.FILE_SEARCH);
                         else if ("Web Search".equalsIgnoreCase(event.text()))
                           state.activeAgent.set(AgentType.WEB_SEARCH);
@@ -564,17 +564,8 @@ public final class AppController implements AutoCloseable {
                 pipeline.setGeneralAgentSystemPrompts(state.generalAgentSystemPromptsSnapshot());
                 webSearchAgent.setSystemPrompt(state.agentPrompt(ModelRole.WEB_SEARCH).get());
                 pipeline.setAvailableAgentRoles(availableRoles);
-                int fileSearchMaxVisited = 120_000;
-                for (ModelAssignment m : state.models) {
-                  ModelAssignment.ProfileConfig mc = state.modelProfileConfig(startupProfile, m);
-                  if (!mc.enabled()) continue;
-                  if (m.memoryOnly || mc.roles().contains(ModelRole.MEMORY)
-                      || mc.roles().contains(ModelRole.FILE_SEARCH)) {
-                    fileSearchMaxVisited = mc.fileSearchMaxVisited();
-                    break;
-                  }
-                }
-                pipeline.setFileSearchMaxVisited(fileSearchMaxVisited);
+                // File Tools are built in and no longer inherit limits from a File Search GGUF.
+                pipeline.setFileSearchMaxVisited(120_000);
                 pipeline.setMainModelKey(mainModelKey);
                 pipeline.setMainContextWindowTokens(config.ctxSize());
                 pipeline.setPromptSnapshot(
@@ -835,7 +826,7 @@ public final class AppController implements AutoCloseable {
       pipeline.setFileRouteSearchConfig(
           pendingMemoryProfile,
           java.util.List.copyOf(state.fileRoutes(pendingMemoryProfile)),
-          state.useSavedFileRoutes(pendingMemoryProfile));
+          !state.fileRoutes(pendingMemoryProfile).isEmpty());
     }
     pipeline.setContextMessageLimit(state.memorySettings.contextMessages.get());
     state.messages.add(new ChatMessage("Вы", message.trim()));
@@ -1358,6 +1349,10 @@ public final class AppController implements AutoCloseable {
   }
 
   private boolean requestFilePermission(FilePermissionRequest request) {
+    if (state.fileToolApprovalMode.get() == FileToolApprovalMode.AUTO_CONFIRM) {
+      System.out.println("[FileTool] auto-confirmed: " + request.operation() + " " + request.path());
+      return true;
+    }
     java.util.concurrent.CompletableFuture<Boolean> decision = new java.util.concurrent.CompletableFuture<>();
     Runnable show = () -> {
       try {
@@ -1368,6 +1363,8 @@ public final class AppController implements AutoCloseable {
           case "read" -> "Прочитать файл";
           case "write" -> "Записать файл";
           case "edit" -> "Изменить файл";
+          case "patch" -> "Применить изменение";
+          case "grep" -> "Искать внутри файлов";
           default -> request.operation();
         };
         alert.setHeaderText(action + "?");
@@ -1381,8 +1378,8 @@ public final class AppController implements AutoCloseable {
         UiStyles.monospace(preview);
         alert.getDialogPane().setExpandableContent(preview);
         alert.getDialogPane().setExpanded(true);
-        ButtonType accept = new ButtonType("Accept", ButtonBar.ButtonData.OK_DONE);
-        ButtonType deny = new ButtonType("Deny", ButtonBar.ButtonData.CANCEL_CLOSE);
+        ButtonType accept = new ButtonType("Подтвердить", ButtonBar.ButtonData.OK_DONE);
+        ButtonType deny = new ButtonType("Отклонить", ButtonBar.ButtonData.CANCEL_CLOSE);
         alert.getButtonTypes().setAll(accept, deny);
         decision.complete(alert.showAndWait().orElse(deny) == accept);
       } catch (Throwable e) {

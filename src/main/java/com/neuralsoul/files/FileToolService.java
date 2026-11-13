@@ -10,24 +10,38 @@ public final class FileToolService {
   private static final int MAX_READ_CHARS = 180_000;
   private static final int MAX_GREP_MATCHES = 80;
   private final FileSearchService search = new FileSearchService();
+  private volatile List<String> preferredRoots = List.of();
 
   public void setSearchMaxVisited(int value) { search.setMaxVisited(value); }
+
+  public void setPreferredRoots(Collection<String> roots) {
+    preferredRoots = roots == null ? List.of() : roots.stream()
+        .filter(Objects::nonNull).map(String::trim).filter(value -> !value.isBlank())
+        .map(FileToolService::resolvePath).distinct().toList();
+  }
 
   public String execute(String operation, List<String> args) throws IOException {
     return switch (operation.toLowerCase(Locale.ROOT)) {
       case "roots" -> roots(args);
       case "list" -> list(args);
+      case "glob" -> glob(args);
       case "search" -> search(args);
       case "grep" -> grep(args);
       case "read" -> read(args);
       case "write" -> write(args);
       case "edit" -> edit(args);
-      default -> "FILE_TOOL_ERROR: unknown operation '" + operation + "'. Supported: roots, list, search, grep, read, write, edit.";
+      case "patch" -> patch(args);
+      default -> "FILE_TOOL_ERROR: unknown operation '" + operation
+          + "'. Supported: roots, list, glob, search, grep, read, write, edit, patch.";
     };
   }
 
   private String roots(List<String> args) {
     StringBuilder out = new StringBuilder("FILE_TOOL_RESULT roots\n");
+    for (String root : preferredRoots) {
+      Path path = Path.of(root);
+      if (Files.exists(path)) out.append("[PREFERRED] ").append(path).append('\n');
+    }
     for (Path root : FileSystems.getDefault().getRootDirectories()) {
       out.append("[ROOT] ").append(root.toAbsolutePath().normalize()).append('\n');
     }
@@ -67,7 +81,9 @@ public final class FileToolService {
     } else {
       query = require(args, 0, "search query");
     }
-    List<FileSearchResult> found = root == null ? search.search(query, 30) : search.searchIn(root, query, 30);
+    List<FileSearchResult> found = root == null
+        ? search.searchPrioritized(preferredRoots, query, 30)
+        : search.searchIn(root, query, 30);
     StringBuilder out = new StringBuilder("FILE_TOOL_RESULT search");
     if (root != null) out.append(" in ").append(root);
     out.append('\n');
@@ -76,19 +92,56 @@ public final class FileToolService {
     return out.toString();
   }
 
+  /** OpenCode-style path glob below an explicit root. It never reads file contents. */
+  private String glob(List<String> args) throws IOException {
+    Path root = path(require(args, 0, "glob root"));
+    String pattern = require(args, 1, "glob pattern").replace('\\', '/');
+    if (!Files.isDirectory(root)) return "FILE_TOOL_ERROR: glob root is not a directory: " + root;
+    PathMatcher matcher = FileSystems.getDefault().getPathMatcher("glob:" + pattern);
+    StringBuilder out = new StringBuilder("FILE_TOOL_RESULT glob ").append(pattern)
+        .append(" in ").append(root).append('\n');
+    int matches = 0;
+    int visited = 0;
+    try (var stream = Files.walk(root, 20)) {
+      Iterator<Path> it = stream.iterator();
+      while (it.hasNext() && visited++ < 120_000 && matches < 100) {
+        Path item = it.next();
+        if (item.equals(root)) continue;
+        Path relative = root.relativize(item);
+        String unix = relative.toString().replace('\\', '/');
+        Path matchPath = Path.of(unix);
+        if (matcher.matches(matchPath) || matcher.matches(item.getFileName())) {
+          out.append(Files.isDirectory(item) ? "[DIR] " : "[FILE] ")
+              .append(item.toAbsolutePath().normalize()).append('\n');
+          matches++;
+        }
+      }
+    }
+    if (matches == 0) out.append("No matching paths found.\n");
+    if (matches >= 100) out.append("[TRUNCATED: 100 matches]\n");
+    return out.toString();
+  }
+
   private String grep(List<String> args) throws IOException {
     Path target = path(require(args, 0, "path"));
-    String needle = require(args, 1, "text to find");
+    String expression = require(args, 1, "regular expression");
     if (!Files.exists(target)) return "FILE_TOOL_ERROR: path does not exist: " + target;
     StringBuilder out = new StringBuilder("FILE_TOOL_RESULT grep ").append(target).append('\n');
+    java.util.regex.Pattern pattern;
+    try {
+      pattern = java.util.regex.Pattern.compile(expression,
+          java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.UNICODE_CASE);
+    } catch (java.util.regex.PatternSyntaxException e) {
+      return "FILE_TOOL_ERROR: invalid grep regular expression: " + e.getDescription();
+    }
     int[] count = {0};
-    if (Files.isRegularFile(target)) grepFile(target, needle, out, count);
+    if (Files.isRegularFile(target)) grepFile(target, pattern, out, count);
     else {
       try (var stream = Files.walk(target, 10)) {
         Iterator<Path> it = stream.filter(Files::isRegularFile).iterator();
         while (it.hasNext() && count[0] < MAX_GREP_MATCHES) {
           Path p = it.next();
-          if (isTextCandidate(p)) grepFile(p, needle, out, count);
+          if (isTextCandidate(p)) grepFile(p, pattern, out, count);
         }
       }
     }
@@ -96,13 +149,15 @@ public final class FileToolService {
     return out.toString();
   }
 
-  private void grepFile(Path file, String needle, StringBuilder out, int[] count) {
-    try {
-      List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
-      String n = needle.toLowerCase(Locale.ROOT);
-      for (int i = 0; i < lines.size() && count[0] < MAX_GREP_MATCHES; i++) {
-        if (lines.get(i).toLowerCase(Locale.ROOT).contains(n)) {
-          out.append(file).append(':').append(i + 1).append(": ").append(lines.get(i)).append('\n');
+  private void grepFile(Path file, java.util.regex.Pattern pattern, StringBuilder out, int[] count) {
+    try (var lines = Files.lines(file, StandardCharsets.UTF_8)) {
+      Iterator<String> iterator = lines.iterator();
+      int line = 0;
+      while (iterator.hasNext() && count[0] < MAX_GREP_MATCHES) {
+        String value = iterator.next();
+        line++;
+        if (pattern.matcher(value).find()) {
+          out.append(file).append(':').append(line).append(": ").append(value).append('\n');
           count[0]++;
         }
       }
@@ -112,10 +167,29 @@ public final class FileToolService {
   private String read(List<String> args) throws IOException {
     Path p = path(require(args, 0, "path"));
     if (!Files.isRegularFile(p)) return "FILE_TOOL_ERROR: not a readable file: " + p;
-    String text = Files.readString(p, StandardCharsets.UTF_8);
-    if (text.length() > MAX_READ_CHARS)
-      text = text.substring(0, MAX_READ_CHARS) + "\n[TRUNCATED: file is larger than " + MAX_READ_CHARS + " characters]";
-    return "FILE_TOOL_RESULT read " + p + "\n" + text;
+    int offset = positiveInt(args, 1, 1);
+    int limit = Math.min(2000, positiveInt(args, 2, 400));
+    StringBuilder out = new StringBuilder("FILE_TOOL_RESULT read ").append(p)
+        .append(" lines ").append(offset).append("-").append(offset + limit - 1).append('\n');
+    int chars = 0;
+    int emitted = 0;
+    int line = 0;
+    try (var lines = Files.lines(p, StandardCharsets.UTF_8)) {
+      Iterator<String> iterator = lines.iterator();
+      while (iterator.hasNext() && emitted < limit && chars < MAX_READ_CHARS) {
+        String value = iterator.next();
+        line++;
+        if (line < offset) continue;
+        String numbered = line + ": " + value + '\n';
+        if (chars + numbered.length() > MAX_READ_CHARS) break;
+        out.append(numbered);
+        chars += numbered.length();
+        emitted++;
+      }
+    }
+    if (emitted == limit || chars >= MAX_READ_CHARS) out.append("[TRUNCATED: request the next offset to continue]\n");
+    if (emitted == 0) out.append("[NO LINES AT THIS OFFSET]\n");
+    return out.toString();
   }
 
   private String write(List<String> args) throws IOException {
@@ -147,6 +221,12 @@ public final class FileToolService {
     String changed = original.substring(0, first) + newText + original.substring(first + oldText.length());
     Files.writeString(p, changed, StandardCharsets.UTF_8, StandardOpenOption.TRUNCATE_EXISTING);
     return "FILE_TOOL_RESULT edit\nEdited: " + p;
+  }
+
+  /** Focused exact replacement; named patch to match the higher-level agent vocabulary. */
+  private String patch(List<String> args) throws IOException {
+    String result = edit(args);
+    return result.replaceFirst("FILE_TOOL_RESULT edit", "FILE_TOOL_RESULT patch");
   }
 
   private static void backup(Path p) throws IOException {
@@ -258,6 +338,12 @@ public final class FileToolService {
   }
 
   private static Path path(String raw) { return Path.of(resolvePath(raw)); }
+
+  private static int positiveInt(List<String> args, int index, int fallback) {
+    if (args == null || index >= args.size() || args.get(index) == null || args.get(index).isBlank()) return fallback;
+    try { return Math.max(1, Integer.parseInt(args.get(index).trim())); }
+    catch (NumberFormatException ignored) { return fallback; }
+  }
   private static String require(List<String> args, int i, String name) {
     if (args == null || i >= args.size() || args.get(i) == null || args.get(i).isBlank())
       throw new IllegalArgumentException("Missing " + name);
